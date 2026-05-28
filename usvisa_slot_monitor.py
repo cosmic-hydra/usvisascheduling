@@ -111,11 +111,29 @@ def require(name: str) -> str:
     return v
 
 
-# ─── chrome / display setup ───────────────────────────────────────────────────
+# ─── chrome / display / platform setup ────────────────────────────────────────
+
+def _is_termux() -> bool:
+    """Return True when running inside Termux on Android."""
+    return bool(
+        os.environ.get("TERMUX_VERSION")
+        or os.environ.get("PREFIX", "").startswith("/data/data/com.termux")
+        or os.path.isdir("/data/data/com.termux")
+    )
+
 
 def _find_chrome() -> str:
     if os.environ.get("CHROME_PATH"):
         return os.environ["CHROME_PATH"]
+
+    # Termux (Android) — Chromium installed via `pkg install chromium`
+    if _is_termux():
+        termux_prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+        for name in ("chromium", "chromium-browser", "google-chrome"):
+            p = os.path.join(termux_prefix, "bin", name)
+            if os.path.isfile(p):
+                return p
+
     if platform.system() == "Windows":
         candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -133,14 +151,19 @@ def _find_chrome() -> str:
         if os.path.isfile(p):
             return p
     raise FileNotFoundError(
-        "Chrome not found in default locations. "
-        "Set the CHROME_PATH environment variable to your Chrome executable."
+        "Chrome not found. "
+        "On Termux run: pkg install chromium\n"
+        "Or set CHROME_PATH in your .env file."
     )
 
 
 def _get_profile_dir() -> str:
     if os.environ.get("TS_PROFILE_DIR"):
         return os.environ["TS_PROFILE_DIR"]
+    if _is_termux():
+        # Use a directory inside Termux home so it persists between runs.
+        home = os.environ.get("HOME", "/data/data/com.termux/files/home")
+        return os.path.join(home, ".usvisa_profile")
     if platform.system() == "Windows":
         base = os.environ.get("TEMP") or r"C:\Temp"
     else:
@@ -149,7 +172,12 @@ def _get_profile_dir() -> str:
 
 
 def _start_xvfb() -> Optional[subprocess.Popen]:
-    """On Linux headless servers, start a virtual display so Chrome can run."""
+    """
+    On headless Linux servers start Xvfb.  Skipped on Windows and on
+    Android/Termux (the Android compositor is already available).
+    """
+    if _is_termux():
+        return None  # Android provides its own display
     if platform.system() != "Linux" or os.environ.get("DISPLAY"):
         return None
     proc = subprocess.Popen(
@@ -161,6 +189,169 @@ def _start_xvfb() -> Optional[subprocess.Popen]:
     time.sleep(0.5)
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] started Xvfb on :99")
     return proc
+
+
+# ─── IP rotation ─────────────────────────────────────────────────────────────
+
+class IPRotator:
+    """
+    Changes the public IP to defeat Cloudflare rate-limiting.
+
+    Supported methods (set via IP_ROTATION_METHOD in .env):
+      tor       — rotate Tor circuit via NEWNYM (default; install with pkg install tor)
+      airplane  — toggle Android airplane mode (requires root)
+      wifi      — cycle WiFi adapter
+      none      — disable rotation (just wait)
+
+    On rate-limit the rotator tries the configured method, verifies the IP
+    actually changed, and logs the result.
+    """
+
+    METHOD_TOR      = "tor"
+    METHOD_AIRPLANE = "airplane"
+    METHOD_WIFI     = "wifi"
+    METHOD_NONE     = "none"
+
+    def __init__(self) -> None:
+        self.method    = env("IP_ROTATION_METHOD", "tor").lower()
+        self._old_ip   = ""
+        self._tor_proc: Optional[subprocess.Popen] = None
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start background services needed by the chosen method."""
+        if self.method == self.METHOD_TOR:
+            self._ensure_tor()
+
+    def get_browser_args(self) -> List[str]:
+        """Extra Chrome flags required for the chosen method."""
+        if self.method == self.METHOD_TOR and self._tor_running():
+            return ["--proxy-server=socks5://127.0.0.1:9050"]
+        return []
+
+    def rotate(self) -> bool:
+        """Execute one IP-rotation cycle. Returns True when IP changed."""
+        _log(f"[IPRotator] rotating via method={self.method!r}")
+        self._old_ip = self._get_ip()
+        _log(f"[IPRotator] current IP: {self._old_ip}")
+
+        ok = False
+        if self.method == self.METHOD_TOR:
+            ok = self._rotate_tor()
+        elif self.method == self.METHOD_AIRPLANE:
+            ok = self._rotate_airplane()
+        elif self.method == self.METHOD_WIFI:
+            ok = self._rotate_wifi()
+        else:
+            _log("[IPRotator] method=none — skipping rotation")
+            return False
+
+        new_ip = self._get_ip()
+        changed = new_ip != self._old_ip and new_ip not in ("", "unknown")
+        _log(f"[IPRotator] new IP: {new_ip} | changed={changed}")
+        return changed
+
+    # ── Tor ───────────────────────────────────────────────────────────────────
+
+    def _ensure_tor(self) -> None:
+        if self._tor_running():
+            return
+        try:
+            self._tor_proc = subprocess.Popen(
+                ["tor",
+                 "--SocksPort",   "9050",
+                 "--ControlPort", "9051",
+                 "--CookieAuthentication", "0",
+                 "--Log", "notice stderr"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _log("[IPRotator] Tor daemon started")
+            time.sleep(8)  # allow bootstrap
+        except FileNotFoundError:
+            _log("[IPRotator] Tor not found — install with: pkg install tor")
+
+    def _tor_running(self) -> bool:
+        import socket as _socket
+        try:
+            with _socket.create_connection(("127.0.0.1", 9050), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    def _rotate_tor(self) -> bool:
+        """Request a new Tor exit circuit (NEWNYM)."""
+        import socket as _socket
+        self._ensure_tor()
+        try:
+            with _socket.create_connection(("127.0.0.1", 9051), timeout=5) as s:
+                s.sendall(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
+                resp = s.recv(256)
+            ok = b"250" in resp
+            if ok:
+                time.sleep(5)  # new circuit takes a moment to become active
+            return ok
+        except Exception as exc:
+            _log(f"[IPRotator] Tor NEWNYM failed: {exc}")
+            return False
+
+    # ── Airplane mode (Android root) ─────────────────────────────────────────
+
+    def _rotate_airplane(self) -> bool:
+        try:
+            subprocess.run(
+                ["su", "-c",
+                 "settings put global airplane_mode_on 1; "
+                 "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"],
+                timeout=6, check=True, capture_output=True,
+            )
+            time.sleep(4)
+            subprocess.run(
+                ["su", "-c",
+                 "settings put global airplane_mode_on 0; "
+                 "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"],
+                timeout=6, check=True, capture_output=True,
+            )
+            time.sleep(10)  # wait for cellular reconnection
+            return True
+        except Exception as exc:
+            _log(f"[IPRotator] airplane-mode toggle failed: {exc}")
+            return False
+
+    # ── WiFi cycle ────────────────────────────────────────────────────────────
+
+    def _rotate_wifi(self) -> bool:
+        # Try Termux:API first, fall back to `svc` (root).
+        for cmd_off, cmd_on in [
+            (["termux-wifi-enable", "false"], ["termux-wifi-enable", "true"]),
+            (["su", "-c", "svc wifi disable"], ["su", "-c", "svc wifi enable"]),
+        ]:
+            try:
+                subprocess.run(cmd_off, timeout=5, capture_output=True)
+                time.sleep(3)
+                subprocess.run(cmd_on, timeout=5, capture_output=True)
+                time.sleep(8)
+                return True
+            except Exception:
+                continue
+        _log("[IPRotator] WiFi cycle failed — no suitable command found")
+        return False
+
+    # ── IP probe ─────────────────────────────────────────────────────────────
+
+    def _get_ip(self) -> str:
+        for url in ["https://api.ipify.org", "https://icanhazip.com"]:
+            try:
+                with request.urlopen(url, timeout=8) as r:
+                    return r.read().decode().strip()
+            except Exception:
+                continue
+        return "unknown"
+
+
+# Module-level singleton — initialised in run().
+_ip_rotator: Optional[IPRotator] = None
 
 
 # ─── data ─────────────────────────────────────────────────────────────────────
@@ -302,10 +493,30 @@ async def _is_rate_limited(tab) -> bool:
 
 async def _handle_rate_limit(tab) -> None:
     """
-    Exponential back-off when Cloudflare is rate-limiting.
-    Waits 30 → 60 → 120 → 240 → 300 s between retries.
+    Defeat Cloudflare rate-limiting by rotating the IP and reloading.
+    Falls back to exponential back-off (30 → 60 → 120 → 240 → 300 s) if the
+    IP rotation method is 'none' or rotation fails.
     """
+    global _ip_rotator
     for attempt in range(5):
+        # Rotate IP first — most effective mitigation.
+        if _ip_rotator and _ip_rotator.method != IPRotator.METHOD_NONE:
+            _log(f"Rate limited — rotating IP (attempt {attempt + 1}/5) ...")
+            rotated = _ip_rotator.rotate()
+            if rotated:
+                _log("IP rotated — reloading page ...")
+                try:
+                    await tab.get(BASE_URL)
+                    await asyncio.sleep(3.0)
+                except Exception:
+                    pass
+                if not await _is_rate_limited(tab):
+                    _log("Rate limit lifted after IP rotation")
+                    return
+                await asyncio.sleep(10)
+                continue
+
+        # IP rotation unavailable or failed — fall back to timed back-off.
         backoff = min(300, 30 * (2 ** attempt)) + random.uniform(0, 20)
         _log(f"Rate limited — backing off {backoff:.0f}s (attempt {attempt + 1}/5)")
         await asyncio.sleep(backoff)
@@ -315,61 +526,93 @@ async def _handle_rate_limit(tab) -> None:
         except Exception:
             pass
         if not await _is_rate_limited(tab):
-            _log("Rate limit lifted — resuming")
+            _log("Rate limit lifted")
             return
+
     _log("WARNING: still rate-limited after 5 attempts — continuing anyway")
 
 
 # ─── Cloudflare: AI challenge classifier ─────────────────────────────────────
 
+def _rule_classify_cf(url: str, title: str, body: str) -> dict:
+    """
+    Built-in rule-based Cloudflare challenge classifier (no API key needed).
+    Returns {"type": str, "action": str}.
+    """
+    u, t, b = url.lower(), title.lower(), body.lower()
+
+    # Rate-limited
+    if any(k in b for k in ["too many requests", "error 1015", "error 429",
+                             "rate limit", "slow down"]):
+        return {"type": "rate_limit", "action": "backoff"}
+
+    # Outright block
+    if ("access denied" in b or "blocked" in b) and "cloudflare" in b:
+        return {"type": "block", "action": "abort"}
+
+    # Waiting room
+    if any(k in b for k in ["waiting room", "you are in the queue",
+                             "queue position", "estimated wait"]):
+        return {"type": "waiting_room", "action": "wait_queue"}
+
+    # Turnstile / security verification
+    if (any(k in b for k in ["verify you are human", "security verification",
+                              "performing security verification", "malicious"])
+            or "challenges.cloudflare.com" in u
+            or "/cdn-cgi/challenge" in u):
+        return {"type": "turnstile", "action": "click_checkbox"}
+
+    # JS check ("Just a moment…")
+    if any(k in t for k in ["just a moment", "attention required",
+                             "one more step", "please wait"]):
+        return {"type": "js_check", "action": "wait_js"}
+
+    return {"type": "none", "action": "proceed"}
+
+
 async def _ai_classify_cf(tab) -> dict:
     """
-    Ask Claude to read the current page and identify what Cloudflare protection
-    is active, returning the best action to take.
-
-    Returns a dict with keys ``type`` and ``action``.  Falls back to
-    ``{"type": "unknown", "action": "proceed"}`` on any error or when the
-    API key is absent.
-
-    Challenge types : none | turnstile | js_check | waiting_room | rate_limit | block
-    Actions         : proceed | click_checkbox | wait_js | wait_queue | backoff | abort
+    Classify the current Cloudflare challenge.
+    Priority: Claude API (if key set) → built-in rule classifier.
+    Returns {"type": str, "action": str}.
     """
-    default: dict = {"type": "unknown", "action": "proceed"}
-    if not _HAS_ANTHROPIC:
-        return default
-    api_key = env("ANTHROPIC_API_KEY")
-    if not api_key:
-        return default
+    url   = await _page_url(tab)
+    title = await _page_title(tab)
+    body  = (await _page_text(tab))[:1500]
 
-    try:
-        url   = await _page_url(tab)
-        title = await _page_title(tab)
-        body  = (await _page_text(tab))[:1500]
+    # Try Claude API.
+    if _HAS_ANTHROPIC:
+        api_key = env("ANTHROPIC_API_KEY")
+        if api_key:
+            try:
+                client = _anthropic.Anthropic(api_key=api_key)
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=128,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Classify the Cloudflare protection on this page. "
+                            "Reply ONLY with compact JSON.\n\n"
+                            f"URL: {url}\nTitle: {title}\nBody: {body}\n\n"
+                            "Types: none, turnstile, js_check, waiting_room, "
+                            "rate_limit, block\n"
+                            "Actions: proceed, click_checkbox, wait_js, "
+                            "wait_queue, backoff, abort\n\n"
+                            'Format: {"type":"...","action":"..."}'
+                        ),
+                    }],
+                )
+                result = json.loads(msg.content[0].text.strip())
+                _log(f"Claude CF analysis: {result}")
+                return result
+            except Exception as exc:
+                _log(f"Claude CF classify failed ({exc}) — falling back to rule AI")
 
-        client = _anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=128,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Analyse this browser page for Cloudflare protection. "
-                    "Reply ONLY with a compact JSON object.\n\n"
-                    f"URL: {url}\nTitle: {title}\nBody snippet: {body}\n\n"
-                    "Challenge types: none, turnstile, js_check, waiting_room, "
-                    "rate_limit, block\n"
-                    "Actions: proceed, click_checkbox, wait_js, wait_queue, "
-                    "backoff, abort\n\n"
-                    'Reply format: {"type":"...","action":"..."}'
-                ),
-            }],
-        )
-        result = json.loads(msg.content[0].text.strip())
-        _log(f"AI CF analysis: {result}")
-        return result
-    except Exception as exc:
-        _log(f"AI CF classify error ({exc}) — using default")
-        return default
+    # Built-in rule classifier (no API key needed).
+    result = _rule_classify_cf(url, title, body)
+    _log(f"Rule-based CF analysis: {result}")
+    return result
 
 
 # ─── Cloudflare: Turnstile ────────────────────────────────────────────────────
@@ -1000,48 +1243,97 @@ async def _extract_question_labels(tab) -> List[str]:
     return []
 
 
+# Security-question keyword patterns: list of (keyword_list, preferred_answer_index).
+# The index is used as a *priority hint* when multiple stored answers are present.
+_SQ_PATTERNS: List[Tuple[List[str], int]] = [
+    (["mother", "maiden", "mom", "mum"], 0),
+    (["born", "birth", "city", "hometown", "birthplace"], 1),
+    (["pet", "dog", "cat", "animal", "childhood pet"], 2),
+    (["school", "elementary", "primary", "first grade", "high school"], 0),
+    (["nickname", "nick name", "called", "childhood name"], 1),
+    (["father", "dad", "papa", "paternal", "father's"], 2),
+    (["street", "road", "address", "grew up", "live"], 0),
+    (["teacher", "favorite teacher", "first teacher"], 1),
+    (["car", "first car", "vehicle"], 2),
+    (["job", "first job", "employer"], 0),
+]
+
+
+def _keyword_match_security_answers(questions: List[str], stored: List[str]) -> List[str]:
+    """
+    Rule-based AI: maps each security question to the most likely stored answer
+    using semantic keyword patterns.  No API key required.
+    """
+    assigned: List[Optional[str]] = [None] * len(questions)
+    used_indices: set = set()
+
+    for qi, question in enumerate(questions):
+        q_lower = question.lower()
+        for keywords, preferred_idx in _SQ_PATTERNS:
+            if any(kw in q_lower for kw in keywords):
+                # Find the preferred answer index that hasn't been used yet.
+                for offset in range(len(stored)):
+                    idx = (preferred_idx + offset) % len(stored)
+                    if idx not in used_indices:
+                        assigned[qi] = stored[idx]
+                        used_indices.add(idx)
+                        break
+                if assigned[qi] is not None:
+                    break
+
+    # Fill any still-unmatched questions sequentially.
+    for qi in range(len(questions)):
+        if assigned[qi] is None:
+            for idx in range(len(stored)):
+                if idx not in used_indices:
+                    assigned[qi] = stored[idx]
+                    used_indices.add(idx)
+                    break
+            if assigned[qi] is None and stored:
+                assigned[qi] = stored[0]
+
+    result = [str(a) for a in assigned]
+    _log(f"keyword AI matched: {list(zip(questions, result))}")
+    return result
+
+
 def _ai_match_answers(questions: List[str], stored: List[str]) -> List[str]:
     """
-    Use Claude to route each stored answer to the question it most likely answers.
-    Falls back to sequential assignment if the API key is absent or the call fails.
+    Match stored security answers to the questions shown on screen.
+    Priority: Claude API (if key set) → keyword AI (always available).
     """
-    if not _HAS_ANTHROPIC:
-        _log("anthropic not installed — sequential answer assignment")
-        return stored[: len(questions)]
+    # Try Claude API first.
+    if _HAS_ANTHROPIC:
+        api_key = env("ANTHROPIC_API_KEY")
+        if api_key:
+            try:
+                client = _anthropic.Anthropic(api_key=api_key)
+                q_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+                a_text = "\n".join(f"Answer {i + 1}: {a}" for i, a in enumerate(stored))
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=256,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Match each stored answer to the security question it answers. "
+                            "Return ONLY a JSON array of answer strings in question order.\n\n"
+                            f"Questions:\n{q_text}\n\n"
+                            f"Stored answers:\n{a_text}\n\n"
+                            'Reply: ["ans1", "ans2", "ans3"]'
+                        ),
+                    }],
+                )
+                m = re.search(r"\[.*?\]", msg.content[0].text.strip(), re.DOTALL)
+                if m:
+                    matched = json.loads(m.group())
+                    _log(f"Claude API matched: {list(zip(questions, matched))}")
+                    return matched
+            except Exception as exc:
+                _log(f"Claude API match failed ({exc}) — falling back to keyword AI")
 
-    api_key = env("ANTHROPIC_API_KEY")
-    if not api_key:
-        _log("ANTHROPIC_API_KEY not set — sequential answer assignment")
-        return stored[: len(questions)]
-
-    try:
-        client = _anthropic.Anthropic(api_key=api_key)
-        q_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-        a_text = "\n".join(f"Answer {i + 1}: {a}" for i, a in enumerate(stored))
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Match each stored answer to the question it most likely answers. "
-                    "Return ONLY a JSON array of answer strings in question order.\n\n"
-                    f"Questions:\n{q_text}\n\n"
-                    f"Stored answers:\n{a_text}\n\n"
-                    'Reply with ONLY a JSON array like: ["ans1", "ans2", "ans3"]'
-                ),
-            }],
-        )
-        response = msg.content[0].text.strip()
-        m = re.search(r"\[.*?\]", response, re.DOTALL)
-        if m:
-            matched = json.loads(m.group())
-            _log(f"AI matched: {list(zip(questions, matched))}")
-            return matched
-    except Exception as exc:
-        _log(f"AI matching failed ({exc}) — sequential assignment")
-
-    return stored[: len(questions)]
+    # Built-in keyword AI (no API key needed).
+    return _keyword_match_security_answers(questions, stored)
 
 
 async def answer_security_questions(tab) -> None:
@@ -1455,6 +1747,178 @@ async def scan_post(tab, dropdown_sel: str, value: str, label: str) -> SlotResul
     return result
 
 
+# ─── auto-booking helpers ─────────────────────────────────────────────────────
+
+_MONTH_FMTS = ["%B %Y", "%b %Y", "%B, %Y", "%b, %Y", "%m/%Y", "%Y-%m"]
+
+
+async def _navigate_to_month(tab, target_dt: datetime, max_forward: int = 36) -> bool:
+    """
+    Click the calendar's 'next month' button until the calendar shows the month
+    that contains target_dt.  Returns True on success.
+    """
+    for _ in range(max_forward):
+        label = (await tab.evaluate(_JS_MONTH_LABEL) or "").strip()
+        if label:
+            for fmt in _MONTH_FMTS:
+                try:
+                    cur = datetime.strptime(label, fmt)
+                    if cur.year == target_dt.year and cur.month == target_dt.month:
+                        return True
+                    if cur > target_dt:
+                        return False  # overshot
+                    break
+                except ValueError:
+                    continue
+        # Advance one month
+        advanced = await tab.evaluate(_JS_NEXT_MONTH)
+        if not advanced:
+            return False
+        await asyncio.sleep(0.7)
+    return False
+
+
+async def _click_calendar_date(tab, date_str: str) -> bool:
+    """
+    Click the cell for date_str in the currently-visible calendar.
+    Tries data attributes first, then falls back to matching the day number.
+    """
+    target_dt = _parse_date(date_str)
+    day_str = str(target_dt.day) if target_dt else ""
+
+    result = await tab.evaluate(f"""
+        (() => {{
+            const ds = {json.dumps(date_str)};
+            const day = {json.dumps(day_str)};
+
+            // Strategy 1: exact attribute match
+            for (const attr of ['data-date','data-value','title','aria-label']) {{
+                const sel = `td[${{attr}}="${{ds}}"]:not(.disabled):not(.unavailable)` +
+                            `,a[${{attr}}="${{ds}}"]`;
+                const el = document.querySelector(sel);
+                if (el) {{ el.click(); return 'attr:'+attr; }}
+            }}
+
+            // Strategy 2: available cell whose text == day number
+            if (day) {{
+                const cells = document.querySelectorAll(
+                    'td.available:not(.disabled):not(.off),' +
+                    'td[data-date]:not(.disabled):not(.unavailable),' +
+                    'td.day:not(.disabled):not(.off)'
+                );
+                for (const c of cells) {{
+                    if ((c.innerText||c.textContent||'').trim() === day) {{
+                        c.click(); return 'day:'+day;
+                    }}
+                }}
+            }}
+            return null;
+        }})()
+    """)
+    return bool(result)
+
+
+async def book_appointment(
+    tab,
+    dropdown_sel: str,
+    post_value: str,
+    post_label: str,
+    target_date: str,
+) -> bool:
+    """
+    Book an appointment at the given post on the given date.
+
+    Flow:
+      1. Select the post in the dropdown
+      2. Open the date-picker
+      3. Navigate to the correct month
+      4. Click the date cell
+      5. Select the first available time slot (if present)
+      6. Submit the form
+      7. Verify a confirmation message appeared
+
+    Returns True when the booking appears to have been submitted successfully.
+    """
+    _log(f"Auto-booking: {post_label} on {target_date}")
+
+    # 1. Select the post.
+    await select_post(tab, dropdown_sel, post_value)
+    await asyncio.sleep(2.5)
+
+    # 2. Open the date-picker.
+    opened = await tab.evaluate(_JS_OPEN_DATEPICKER)
+    await asyncio.sleep(1.0)
+    if not opened:
+        _log("Could not open date-picker")
+
+    # 3. Navigate to the correct month.
+    target_dt = _parse_date(target_date)
+    if target_dt:
+        navigated = await _navigate_to_month(tab, target_dt)
+        if not navigated:
+            _log(f"Could not navigate calendar to {target_date} — trying direct click anyway")
+
+    # 4. Click the date cell.
+    clicked = await _click_calendar_date(tab, target_date)
+    if not clicked:
+        _log(f"Could not click date {target_date} in calendar — aborting booking")
+        return False
+    _log(f"Clicked date cell: {target_date}")
+    await asyncio.sleep(1.5)
+
+    # 5. Select first available time slot (optional).
+    time_val = await tab.evaluate("""
+        (() => {
+            for (const sel of [
+                'select[name*="time"]','select[id*="time"]',
+                '#appointments_consulate_appointment_time',
+            ]) {
+                const s = document.querySelector(sel);
+                if (!s) continue;
+                const opt = s.querySelector('option:not([value=""]):not([disabled])');
+                if (opt) {
+                    s.value = opt.value;
+                    s.dispatchEvent(new Event('change', {bubbles:true}));
+                    return opt.value;
+                }
+            }
+            return null;
+        })()
+    """)
+    if time_val:
+        _log(f"Selected time slot: {time_val}")
+        await asyncio.sleep(1.0)
+
+    # 6. Submit.
+    submitted = await _click(tab, [
+        "#appointments_submit",
+        "input[type='submit']",
+        "button[type='submit']",
+    ])
+    if not submitted:
+        submitted = await _click_by_text(tab, r"confirm|book|submit|reschedule|schedule")
+    if not submitted:
+        _log("Submit button not found — booking may have failed")
+        return False
+
+    _log("Booking form submitted")
+    await asyncio.sleep(4.0)
+    await _log_page_state(tab, "after booking submit")
+
+    # 7. Verify confirmation.
+    text = await _page_text(tab)
+    confirmed = any(phrase in text for phrase in [
+        "confirmed", "booked", "appointment scheduled",
+        "reschedule successful", "booking successful",
+        "your appointment", "successfully",
+    ])
+    if confirmed:
+        _log(f"Booking CONFIRMED: {post_label} on {target_date}")
+    else:
+        _log("Booking submitted (confirmation message not detected — check manually)")
+    return True
+
+
 # ─── Telegram notification ────────────────────────────────────────────────────
 
 def send_telegram(text: str) -> None:
@@ -1543,10 +2007,11 @@ async def _login_flow(tab) -> None:
     await cf_guard(tab)
 
 
-async def _scan_cycle(tab, cycle: int) -> Optional[SlotResult]:
+async def _scan_cycle(tab, cycle: int):
     """
-    One full scan: reschedule page → dropdown → all posts → report.
-    Returns the best SlotResult found (or None).
+    One full scan: reschedule page → ALL posts → find global earliest → auto-book.
+
+    Returns (best: SlotResult | None, report: str, booking_note: str).
     """
     _log(f"--- Cycle {cycle}: navigate to reschedule ---")
     await goto_reschedule(tab)
@@ -1581,41 +2046,76 @@ async def _scan_cycle(tab, cycle: int) -> Optional[SlotResult]:
 
     _log(f"--- Cycle {cycle}: scan {len(options)} post(s) ---")
     results: List[SlotResult] = []
+    post_map: dict = {}  # label → (value, label)
     for i, (value, label) in enumerate(options, 1):
         _log(f"post {i}/{len(options)}: {label!r}")
-        results.append(await scan_post(tab, dropdown_sel, value, label))
+        r = await scan_post(tab, dropdown_sel, value, label)
+        results.append(r)
+        post_map[label] = (value, label)
 
     report, best = build_report(results)
-    booking_note = await try_auto_book(tab, best)
 
     plain = re.sub(r"<[^>]+>", "", report)
     print("\n" + "=" * 60)
     print(plain)
-    if booking_note:
-        print(booking_note)
     print("=" * 60 + "\n")
+
+    # ── Auto-book the globally earliest slot ─────────────────────────────────
+    booking_note = ""
+    if best and best.earliest:
+        post_value, post_label_full = post_map.get(best.post, (None, best.post))
+        if post_value:
+            _log(f"Auto-booking globally earliest slot: {best.earliest} @ {best.post}")
+            try:
+                booked = await book_appointment(
+                    tab, dropdown_sel, post_value, best.post, best.earliest
+                )
+                booking_note = (
+                    f"BOOKED: {best.post} on {best.earliest}"
+                    if booked
+                    else f"BOOKING FAILED: {best.post} on {best.earliest}"
+                )
+                # Notify via Telegram immediately after booking attempt.
+                tg = report + f"\n\n<b>{booking_note}</b>"
+                send_telegram(tg)
+            except Exception as exc:
+                booking_note = f"BOOKING ERROR: {exc}"
+                _log(f"Booking exception: {exc}")
+        else:
+            booking_note = "Could not find post value for booking"
 
     return best, report, booking_note
 
 
 async def run() -> None:
-    chrome = _find_chrome()
+    global _ip_rotator
+
+    chrome  = _find_chrome()
     profile = _get_profile_dir()
     interval = int(env("MONITOR_INTERVAL_MINUTES", "15"))
-    # NOTIFY_ONLY_ON_IMPROVEMENT=false sends Telegram every cycle regardless.
     notify_only_improvement = env("NOTIFY_ONLY_ON_IMPROVEMENT", "true").lower() != "false"
 
+    # Initialise IP rotator.
+    _ip_rotator = IPRotator()
+    _ip_rotator.start()
+    extra_args = _ip_rotator.get_browser_args()
+
     _log("=== US Visa Slot Monitor starting ===")
-    _log(f"Chrome  : {chrome}")
-    _log(f"Profile : {profile}")
-    _log(f"Site    : {BASE_URL}")
-    _log(f"Interval: {interval} min | notify_only_improvement={notify_only_improvement}")
+    _log(f"Chrome   : {chrome}")
+    _log(f"Profile  : {profile}")
+    _log(f"Site     : {BASE_URL}")
+    _log(f"Termux   : {_is_termux()}")
+    _log(f"IP rotate: {_ip_rotator.method}")
+    _log(f"Interval : {interval} min | notify_only_improvement={notify_only_improvement}")
+    if extra_args:
+        _log(f"Chrome extra args: {extra_args}")
 
     browser = await uc.start(
         browser_executable_path=chrome,
         headless=False,
         user_data_dir=profile,
         no_sandbox=True,
+        browser_args=extra_args if extra_args else None,
     )
     _log("Chrome launched")
 
