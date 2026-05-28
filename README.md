@@ -1,4 +1,4 @@
-# EzSolver Setup Guide (Termux + Windows CMD)
+# usvisascheduling Setup Guide (Termux + Windows CMD)
 
 This guide is a full from-scratch tutorial for running this project on:
 
@@ -55,8 +55,8 @@ pip --version
 ### 2. Clone Project
 
 ```bash
-git clone https://github.com/ismoiloffS/EzSolver.git
-cd EzSolver
+git clone https://github.com/cosmic-hydra/usvisascheduling.git
+cd usvisascheduling
 ```
 
 ### 3. Install Python Dependencies
@@ -143,8 +143,8 @@ git --version
 ### 3. Clone Project
 
 ```cmd
-git clone https://github.com/ismoiloffS/EzSolver.git
-cd EzSolver
+git clone https://github.com/cosmic-hydra/usvisascheduling.git
+cd usvisascheduling
 ```
 
 ### 4. Install Dependencies
@@ -292,8 +292,8 @@ Termux quick run:
 ```bash
 pkg update -y && pkg upgrade -y
 pkg install -y python git
-git clone https://github.com/ismoiloffS/EzSolver.git
-cd EzSolver
+git clone https://github.com/cosmic-hydra/usvisascheduling.git
+cd usvisascheduling
 pip install -r requirements.txt
 python service.py
 ```
@@ -301,8 +301,8 @@ python service.py
 Windows CMD quick run:
 
 ```cmd
-git clone https://github.com/ismoiloffS/EzSolver.git
-cd EzSolver
+git clone https://github.com/cosmic-hydra/usvisascheduling.git
+cd usvisascheduling
 python -m pip install -r requirements.txt
 python service.py
 ```
