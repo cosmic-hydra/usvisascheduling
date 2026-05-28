@@ -1,298 +1,308 @@
-<div align="center">
+# EzSolver Setup Guide (Termux + Windows CMD)
 
-<h1>USVISASCHEDULING.COM bot</h1>
+This guide is a full from-scratch tutorial for running this project on:
 
-<p><strong>Fast, cross-platform Cloudflare Turnstile solver powered by a real browser.</strong><br/>
-No paid APIs. No third-party services. Just Python and Chrome.</p>
+- Termux (Android)
+- Windows Command Prompt (CMD)
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python)](https://python.org)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square)]()
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)]()
-[![Made by](https://img.shields.io/badge/Made%20by-Ismoiloff-orange?style=flat-square)](https://github.com/ismoiloffS)
+You will learn how to:
 
-</div>
-
----
-
-## How it works
-
-EzSolver injects a Turnstile widget directly into the target page using a real Chrome browser via [nodriver](https://github.com/ultrafunkamsterdam/nodriver). Because it runs in a genuine browser with a persistent profile, Cloudflare's fingerprinting sees a real user — no token farms, no captcha services needed.
-
-- **Invisible widgets** resolve automatically within seconds
-- **Managed (checkbox) widgets** are clicked with human-like mouse movement
-- On Linux servers, a virtual display (Xvfb) is started automatically — no `xvfb-run` needed
-- Chrome path and profile directory are auto-detected per OS, with env var overrides
+1. Install all dependencies
+2. Clone and set up the project
+3. Configure environment variables with a .env file
+4. Run each script (solver, service, client, slot monitor)
+5. Fix common errors quickly
 
 ---
 
-## Requirements
+## What Is In This Repo
 
-- Python **3.8+**
-- Google Chrome installed
-- `nodriver` Python package
-- **Linux only:** `Xvfb` (for headless servers)
+- solver.py: solves one Cloudflare Turnstile challenge and prints a token
+- service.py: starts a local HTTP API server to solve multiple requests
+- clientsend.py: sends a request to service.py from terminal
+- usvisa_slot_monitor.py: logs in and checks US visa slots automatically
 
 ---
 
-## Installation
+## Important Compatibility Notes
 
-**1. Clone the repo**
+- Windows CMD: fully supported.
+- Termux: best for Python scripts and API/client flow.
+- usvisa_slot_monitor.py uses Playwright browser automation and may be limited on pure Android Termux without a full desktop-like browser environment.
+
+If you need the most reliable slot monitor execution, use Windows or a Linux VPS.
+
+---
+
+## Part 1: Termux Setup (Android)
+
+### 1. Install Termux
+
+Install Termux from F-Droid (recommended). Open Termux and run:
+
+```bash
+pkg update -y && pkg upgrade -y
+pkg install -y python git curl
+```
+
+Check Python:
+
+```bash
+python --version
+pip --version
+```
+
+### 2. Clone Project
 
 ```bash
 git clone https://github.com/ismoiloffS/EzSolver.git
 cd EzSolver
 ```
 
-**2. Install the Python dependency**
+### 3. Install Python Dependencies
 
 ```bash
-pip install nodriver
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-**3. Linux headless servers only — install Xvfb**
+### 4. Create .env File
+
+Create .env in the project root:
 
 ```bash
-sudo apt install xvfb
+cat > .env << 'EOF'
+USVISA_USERNAME=your_username
+USVISA_PASSWORD=your_password
+USVISA_Q1=your_answer_1
+USVISA_Q2=your_answer_2
+USVISA_Q3=your_answer_3
+EOF
 ```
 
-> Windows users: nothing extra needed, Chrome runs normally.
-
----
-
-## Usage
-
-### Option A — Standalone solver (single token)
-
-Run `solver.py` directly from the command line:
+Optional settings:
 
 ```bash
-python solver.py <sitekey> <siteurl>
+cat >> .env << 'EOF'
+PORT=8191
+MAX_WORKERS=2
+EOF
 ```
 
-**Example:**
+### 5. Run Scripts In Termux
+
+Single solve:
 
 ```bash
-python solver.py 0x4AAAAAAActoBfh_En8yr3T https://example.com/
+python solver.py YOUR_SITEKEY https://example.com/
 ```
 
-**Output:**
-
-```
-[solver] clicking Cloudflare iframe at (48, 52)
-0.abc123...longtoken...xyz
-```
-
----
-
-### Option B — Local API service
-
-Start `service.py` once and send as many solve requests as you want via HTTP.
-
-**Start the service:**
+Start API service:
 
 ```bash
 python service.py
 ```
 
-```
-[service] Turnstile solver service running on http://0.0.0.0:8191
-```
-
-**Send a request with the CLI client:**
+In another Termux session, send request:
 
 ```bash
-python clientsend.py <sitekey> <siteurl> [timeout]
+python clientsend.py YOUR_SITEKEY https://example.com/ 45
 ```
+
+Run visa monitor:
 
 ```bash
-python clientsend.py 0x4AAAAAAActoBfh_En8yr3T https://example.com/
+python usvisa_slot_monitor.py
 ```
 
-```
-Token (14.32s): 0.abc123...longtoken...xyz
+If slot monitor fails in Termux because browser automation is unavailable, run it on Windows CMD instead.
+
+---
+
+## Part 2: Windows CMD Setup (From Scratch)
+
+### 1. Install Python
+
+1. Download Python 3.10+ from python.org
+2. During install, enable Add Python to PATH
+3. Open CMD and verify:
+
+```cmd
+python --version
+pip --version
 ```
 
-**Or call it from your own code / any HTTP client:**
+### 2. Install Git
+
+Install Git for Windows, then verify:
+
+```cmd
+git --version
+```
+
+### 3. Clone Project
+
+```cmd
+git clone https://github.com/ismoiloffS/EzSolver.git
+cd EzSolver
+```
+
+### 4. Install Dependencies
+
+```cmd
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### 5. Create .env File In CMD
+
+Run these lines exactly in CMD:
+
+```cmd
+(
+echo USVISA_USERNAME=your_username
+echo USVISA_PASSWORD=your_password
+echo USVISA_Q1=your_answer_1
+echo USVISA_Q2=your_answer_2
+echo USVISA_Q3=your_answer_3
+) > .env
+```
+
+Append optional variables:
+
+```cmd
+(
+echo PORT=8191
+echo MAX_WORKERS=4
+) >> .env
+```
+
+### 6. Run Scripts In CMD
+
+Single solve:
+
+```cmd
+python solver.py YOUR_SITEKEY https://example.com/
+```
+
+Start API service:
+
+```cmd
+python service.py
+```
+
+Send request from another CMD window:
+
+```cmd
+python clientsend.py YOUR_SITEKEY https://example.com/ 45
+```
+
+Run visa monitor:
+
+```cmd
+python usvisa_slot_monitor.py
+```
+
+### 7. One-Click Run (Windows)
+
+You can also use:
+
+```cmd
+run.bat
+```
+
+This checks Python, installs dependencies, and starts usvisa_slot_monitor.py.
+
+---
+
+## Part 3: Environment Variables Reference
+
+Required for visa monitor:
+
+- USVISA_USERNAME: login username or email
+- USVISA_PASSWORD: account password
+- USVISA_Q1: security question answer 1
+- USVISA_Q2: security question answer 2
+- USVISA_Q3: security question answer 3
+
+Common optional:
+
+- USVISA_POSTS: comma-separated posts list
+- TELEGRAM_BOT_TOKEN: Telegram bot token
+- TELEGRAM_CHAT_ID: Telegram chat id
+- AUTO_BOOK: true or false
+- PORT: API service port (default 8191)
+- MAX_WORKERS: concurrent solve workers (default 4)
+
+---
+
+## Part 4: API Usage
+
+Start service:
+
+```bash
+python service.py
+```
+
+Send request with curl:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8191/solve \
   -H "Content-Type: application/json" \
-  -d '{"sitekey":"0x4AAAAAAActoBfh_En8yr3T","siteurl":"https://example.com/"}'
+  -d '{"sitekey":"YOUR_SITEKEY","siteurl":"https://example.com/","timeout":45}'
 ```
 
-```json
-{
-  "token": "0.abc123...longtoken...xyz",
-  "elapsed": 14.32
-}
-```
-
-**Use it from Python:**
-
-```python
-from clientsend import request_token
-
-token, elapsed = request_token(
-    sitekey="0x4AAAAAAActoBfh_En8yr3T",
-    siteurl="https://example.com/"
-)
-print(f"Got token in {elapsed}s: {token}")
-```
-
----
-
-## API reference
-
-### `POST /solve`
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `sitekey` | string | yes | — | Turnstile sitekey from the target page |
-| `siteurl` | string | yes | — | Full URL of the page with the Turnstile widget |
-| `timeout` | integer | no | `45` | Max seconds to wait for a token |
-
-**Success response `200`:**
-```json
-{ "token": "0.abc...", "elapsed": 12.5 }
-```
-
-**Error response `500`:**
-```json
-{ "error": "Turnstile token not obtained within 45s" }
-```
-
-### `GET /health`
-
-Returns current service status — useful for uptime checks and monitoring queue depth.
-
-```json
-{ "status": "ok", "workers": 4, "active": 2, "queued": 5 }
-```
-
----
-
-## Scaling
-
-EzSolver uses a **worker pool** to handle high volumes safely. Instead of spinning up unlimited Chrome instances (which would crash your machine), requests queue up and are processed as workers free up — no requests are dropped.
-
-```
-500 requests → queue → [worker 1] [worker 2] [worker 3] [worker 4] → tokens
-```
-
-**Rule of thumb:** each Chrome worker uses ~500 MB RAM.
-
-| Machine RAM | Recommended `MAX_WORKERS` | Throughput (est.) |
-|-------------|--------------------------|-------------------|
-| 2 GB | 2 | ~8 tokens/min |
-| 4 GB | 4 (default) | ~16 tokens/min |
-| 8 GB | 8 | ~32 tokens/min |
-| 16 GB+ | 16 | ~64 tokens/min |
-
-Set `MAX_WORKERS` when starting the service:
-
-```bash
-MAX_WORKERS=8 python service.py
-```
-
-Check the queue live via `/health`:
+Health check:
 
 ```bash
 curl http://127.0.0.1:8191/health
 ```
 
-```json
-{ "status": "ok", "workers": 8, "active": 6, "queued": 47 }
-```
+---
 
-For truly massive scale (thousands of concurrent solves), run **multiple service instances** behind a load balancer (nginx, Caddy, etc.) across several machines.
+## Part 5: Troubleshooting
+
+Python command not found (Windows):
+
+- Reinstall Python and enable Add Python to PATH
+
+pip install fails:
+
+- Run python -m pip install --upgrade pip
+- Retry with stable internet
+
+Cannot reach service at 127.0.0.1:8191:
+
+- Make sure python service.py is running in another terminal
+
+No token returned before timeout:
+
+- Increase timeout value in clientsend.py command
+
+Termux browser/automation issues:
+
+- Use Windows CMD or Linux VPS for full browser automation workloads
 
 ---
 
-## Configuration
+## Quick Start Cheat Sheet
 
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `CHROME_PATH` | auto-detected | Path to your Chrome executable |
-| `TS_PROFILE_DIR` | `%TEMP%\ts_profile` / `/tmp/ts_profile` | Persistent Chrome profile directory |
-| `PORT` | `8191` | Port the service listens on |
-| `MAX_WORKERS` | `4` | Max concurrent Chrome instances |
+Termux quick run:
 
-**Example:**
 ```bash
-MAX_WORKERS=8 PORT=9000 python service.py
+pkg update -y && pkg upgrade -y
+pkg install -y python git
+git clone https://github.com/ismoiloffS/EzSolver.git
+cd EzSolver
+pip install -r requirements.txt
+python service.py
 ```
 
----
+Windows CMD quick run:
 
-## US Visa Slot Monitor
-
-`usvisa_slot_monitor.py` logs into [usvisascheduling.com](https://www.usvisascheduling.com/en-US), navigates to the Reschedule Appointment page, scans each configured OFC post for the earliest available slot, and optionally sends a Telegram notification or auto-books the best slot found.
-
-```bash
-pip install playwright
-playwright install chromium
-
-# required
-export USVISA_USERNAME="your@email.com"
-export USVISA_PASSWORD="yourpassword"
-export USVISA_Q1="answer1"
-export USVISA_Q2="answer2"
-export USVISA_Q3="answer3"
-
-python usvisa_slot_monitor.py
+```cmd
+git clone https://github.com/ismoiloffS/EzSolver.git
+cd EzSolver
+python -m pip install -r requirements.txt
+python service.py
 ```
-
-**Environment variables:**
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `USVISA_USERNAME` | yes | — | Login email |
-| `USVISA_PASSWORD` | yes | — | Login password |
-| `USVISA_Q1` / `Q2` / `Q3` | yes | — | Security question answers |
-| `USVISA_POSTS` | no | `chennai,delhi,bangalore,mumbai,hyderabad,kolkata` | Comma-separated OFC posts to check |
-| `TELEGRAM_BOT_TOKEN` | no | — | Telegram bot token for notifications |
-| `TELEGRAM_CHAT_ID` | no | — | Telegram chat ID for notifications |
-| `AUTO_BOOK` | no | `false` | Set to `true` to auto-book the earliest slot |
-| `RESCHEDULE_LINK_TEXT` | no | `Reschedule Appointment` | Link text to click to reach the reschedule page |
-| `LOGIN_EMAIL_SELECTOR` | no | `input[type='email']` | Override CSS selector for email field |
-| `LOGIN_PASSWORD_SELECTOR` | no | `input[type='password']` | Override CSS selector for password field |
-| `LOGIN_SUBMIT_SELECTOR` | no | `button[type='submit']` | Override CSS selector for login button |
-| `SECURITY_ANSWER_INPUTS_SELECTOR` | no | `input[type='text']` | Override selector for security answer inputs |
-| `POST_DROPDOWN_SELECTOR` | no | auto | Override selector for the OFC post dropdown |
-| `EARLIEST_DATE_SELECTOR` | no | auto | Override selector for the earliest date element |
-| `BOOK_DATE_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — date picker selector |
-| `BOOK_TIME_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — time picker selector |
-| `BOOK_SUBMIT_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — submit button selector |
-
----
-
-## Project structure
-
-```
-EzSolver/
-├── solver.py                # Core solver — browser automation logic
-├── service.py               # HTTP API wrapper around the solver
-├── clientsend.py            # CLI client + importable helper for service.py
-└── usvisa_slot_monitor.py   # US visa appointment slot monitor (Playwright)
-```
-
----
-
-## Troubleshooting
-
-**Chrome not found**
-> Set `CHROME_PATH` to the full path of your Chrome executable.
-
-**Timeout / token not received**
-> The target site may be serving a harder challenge. Try increasing the timeout: `python clientsend.py <key> <url> 90`
-
-**Linux: Xvfb not found**
-> `sudo apt install xvfb`
-
----
-
-<div align="center">
-
-Made with ☕ by [Ismoiloff](https://github.com/ismoiloffS)
-
-</div>
