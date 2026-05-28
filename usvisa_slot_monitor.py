@@ -153,7 +153,7 @@ def _start_xvfb() -> Optional[subprocess.Popen]:
     )
     os.environ["DISPLAY"] = ":99"
     time.sleep(0.5)
-    print("[monitor] started Xvfb on :99")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] started Xvfb on :99")
     return proc
 
 
@@ -168,6 +168,12 @@ class SlotResult:
 
 
 # ─── Cloudflare: page helpers ─────────────────────────────────────────────────
+
+def _log(msg: str) -> None:
+    """Timestamped log line."""
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
 
 async def _page_text(tab) -> str:
     """Return lowercased body text (safe — returns '' on any error)."""
@@ -186,6 +192,25 @@ async def _page_url(tab) -> str:
         return await tab.evaluate("window.location.href") or ""
     except Exception:
         return ""
+
+
+async def _page_title(tab) -> str:
+    try:
+        return await tab.evaluate("document.title") or ""
+    except Exception:
+        return ""
+
+
+async def _log_page_state(tab, label: str = "") -> None:
+    """Print current URL, title, and first 120 chars of body text."""
+    url   = await _page_url(tab)
+    title = await _page_title(tab)
+    body  = await _page_text(tab)
+    snippet = " ".join(body.split())[:120]
+    prefix = f"[page{' — ' + label if label else ''}]"
+    _log(f"{prefix} URL   : {url}")
+    _log(f"{prefix} Title : {title}")
+    _log(f"{prefix} Body  : {snippet}")
 
 
 # ─── Cloudflare: Waiting Room ─────────────────────────────────────────────────
@@ -214,8 +239,9 @@ async def handle_waiting_room(tab) -> None:
     if not await _is_waiting_room(tab):
         return
 
-    print(f"[monitor] Cloudflare Waiting Room detected — "
-          f"waiting up to {max_minutes} min (checking every 20 s) ...")
+    _log(f"Cloudflare Waiting Room detected — "
+         f"waiting up to {max_minutes} min (checking every 20 s) ...")
+    await _log_page_state(tab, "waiting room")
 
     deadline = asyncio.get_event_loop().time() + max_minutes * 60
 
@@ -243,7 +269,7 @@ async def handle_waiting_room(tab) -> None:
         await asyncio.sleep(20)
 
         if not await _is_waiting_room(tab):
-            print("[monitor] Waiting Room passed — continuing")
+            _log("Waiting Room passed — continuing")
             return
 
     raise TimeoutError(
@@ -277,20 +303,22 @@ async def _cf_iframe_rect(tab) -> Optional[dict]:
 
 async def solve_turnstile(tab, timeout: int = 60) -> None:
     """
-    Handle a Cloudflare Turnstile widget on the current page.
+    Handle a Cloudflare Turnstile CHECKBOX widget on the current page.
 
-    - Invisible widgets auto-resolve; we just wait for the token.
-    - Visible/checkbox widgets need a human-like click on the iframe.
+    Only activates when a challenges.cloudflare.com iframe is actually present
+    (the visible/managed checkbox widget).  Invisible widgets resolve on their
+    own and the pure JS-challenge "Just a moment" page is handled by cf_guard.
     """
-    has_ts = await tab.evaluate("""
-        !!(document.querySelector('iframe[src*="challenges.cloudflare.com"]')
-           || window.turnstile
-           || document.querySelector('[name="cf-turnstile-response"]'))
-    """)
-    if not has_ts:
-        return  # no challenge on this page
+    # Only trigger on a real Turnstile iframe — NOT on bare window.turnstile
+    # which is injected on every CF-protected page regardless of widget type.
+    iframe_present = await tab.evaluate(
+        "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')"
+    )
+    if not iframe_present:
+        return  # no checkbox widget — nothing to click
 
-    print("[monitor] Cloudflare Turnstile detected — solving ...")
+    _log("Cloudflare Turnstile checkbox widget detected — solving ...")
+    await _log_page_state(tab, "turnstile")
     deadline = asyncio.get_event_loop().time() + timeout
     clicks = 0
     last_click = 0.0
@@ -304,25 +332,25 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
             })()
         """)
         if token:
-            print("[monitor] Turnstile solved (token obtained)")
+            _log("Turnstile solved (token obtained)")
             return
 
-        # Challenge iframe gone → page moved on
-        iframe_present = await tab.evaluate(
+        # iframe gone → challenge passed / page navigated
+        still_there = await tab.evaluate(
             "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')"
         )
-        if not iframe_present:
-            print("[monitor] Turnstile iframe gone — challenge passed")
+        if not still_there:
+            _log("Turnstile iframe gone — challenge passed")
             return
 
-        # Click the checkbox iframe (retry up to 4 times, every 10 s)
+        # Click the checkbox (retry up to 4 times, every 10 s)
         now = asyncio.get_event_loop().time()
         if clicks == 0 or (now - last_click > 10 and clicks < 4):
             rect = await _cf_iframe_rect(tab)
             if rect:
                 cx = rect["x"] + 28 + random.uniform(-3, 3)
                 cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
-                print(f"[monitor] clicking Turnstile checkbox at ({cx:.0f}, {cy:.0f})")
+                _log(f"clicking Turnstile checkbox at ({cx:.0f}, {cy:.0f})")
                 await tab.mouse_move(cx - 60, cy - 15)
                 await asyncio.sleep(random.uniform(0.15, 0.25))
                 await tab.mouse_move(cx, cy)
@@ -333,13 +361,61 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
 
         await asyncio.sleep(0.5)
 
-    print("[monitor] Turnstile: timed out — continuing anyway")
+    _log("Turnstile: timed out — continuing anyway")
+    await _log_page_state(tab, "after turnstile timeout")
 
 
-async def cf_guard(tab) -> None:
-    """Run the full Cloudflare gating sequence: Waiting Room → Turnstile."""
+async def _is_cf_challenge(tab) -> bool:
+    """Return True if the page is any Cloudflare challenge (JS check, Turnstile, waiting room)."""
+    title = (await _page_title(tab)).lower()
+    if "just a moment" in title:
+        return True
+    text = await _page_text(tab)
+    if "performing security verification" in text:
+        return True
+    return await _is_waiting_room(tab)
+
+
+async def cf_guard(tab, timeout: int = 90) -> None:
+    """
+    Wait until all Cloudflare challenges clear.
+
+    Handles three kinds:
+    1. Cloudflare Waiting Room  — periodic polling
+    2. JS Challenge ("Just a moment...")  — Chrome passes this automatically; we wait
+    3. Turnstile checkbox widget  — we click it
+    """
     await handle_waiting_room(tab)
-    await solve_turnstile(tab)
+
+    # If already past any challenge, return immediately
+    if not await _is_cf_challenge(tab):
+        _log("No CF challenge detected — proceeding")
+        return
+
+    _log("CF challenge active — waiting for Chrome to pass it ...")
+    deadline = asyncio.get_event_loop().time() + timeout
+    poll = 0
+    while asyncio.get_event_loop().time() < deadline:
+        # If a Turnstile checkbox has appeared, click it
+        await solve_turnstile(tab)
+
+        if not await _is_cf_challenge(tab):
+            _log("CF challenge cleared")
+            await _log_page_state(tab, "after cf_guard")
+            await asyncio.sleep(1.0)
+            return
+
+        poll += 1
+        if poll % 5 == 0:
+            await _log_page_state(tab, f"cf_guard poll {poll}")
+        else:
+            title = await _page_title(tab)
+            _log(f"still on CF challenge (title: '{title}', elapsed: {int(asyncio.get_event_loop().time()-(deadline-timeout))}s)")
+
+        await asyncio.sleep(2.0)
+
+    _log("WARNING: CF challenge still active after timeout — proceeding anyway")
+    await _log_page_state(tab, "cf_guard timeout")
     await asyncio.sleep(1.0)
 
 
@@ -396,17 +472,31 @@ async def wait_for_login_page(tab, timeout: int = 180) -> None:
         "input[id*='email']",
         "input[name*='user']",
     ]
+    _log("waiting for login page ...")
+    await _log_page_state(tab, "before login wait")
     deadline = asyncio.get_event_loop().time() + timeout
+    last_url = ""
+    poll = 0
     while asyncio.get_event_loop().time() < deadline:
-        await cf_guard(tab)
+        # Only solve CF guard when URL changes, not every poll
+        url = await _page_url(tab)
+        if url != last_url:
+            _log(f"URL changed -> {url}")
+            last_url = url
+            await cf_guard(tab)
         for sel in checks:
             try:
                 el = await tab.select(sel)
                 if el:
-                    print("[monitor] login page ready")
+                    _log(f"login page ready (found: {sel})")
+                    await _log_page_state(tab, "login page")
                     return
             except Exception:
                 pass
+        poll += 1
+        if poll % 5 == 0:
+            _log(f"still waiting for login page ... ({int(asyncio.get_event_loop().time()-(deadline-timeout))}s elapsed)")
+            await _log_page_state(tab, "login wait poll")
         await asyncio.sleep(3.0)
     raise RuntimeError("Login page did not appear within 3 minutes")
 
@@ -414,48 +504,64 @@ async def wait_for_login_page(tab, timeout: int = 180) -> None:
 async def perform_login(tab) -> None:
     username = require("USVISA_USERNAME")
     password = require("USVISA_PASSWORD")
-    print(f"[monitor] logging in as {username[:3]}***")
+    _log(f"logging in as {username[:3]}***")
 
-    if not await _fill(
+    filled_user = await _fill(
         tab,
         ["input[type='email']", "#user_email",
          "input[name='user[email]']", "input[name*='email']"],
         username,
-    ):
+    )
+    _log(f"username field filled: {filled_user}")
+    if not filled_user:
         raise RuntimeError("Email/username input not found on login page")
 
-    if not await _fill(
+    filled_pass = await _fill(
         tab,
         ["input[type='password']", "#user_password",
          "input[name='user[password]']", "input[name*='password']"],
         password,
-    ):
+    )
+    _log(f"password field filled: {filled_pass}")
+    if not filled_pass:
         raise RuntimeError("Password input not found on login page")
 
-    if not await _click(tab, ["button[type='submit']", "input[type='submit']"]):
-        await _click_by_text(tab, r"sign.?in|log.?in")
+    clicked = await _click(tab, ["button[type='submit']", "input[type='submit']"])
+    if not clicked:
+        _log("submit button not found via CSS — trying text search")
+        clicked = await _click_by_text(tab, r"sign.?in|log.?in")
+    _log(f"submit clicked: {clicked}")
 
+    _log("waiting for post-login redirect ...")
     await asyncio.sleep(4.0)
+    await _log_page_state(tab, "after login submit")
     await cf_guard(tab)
-    print("[monitor] login form submitted")
+    _log("login form submitted")
 
 
 async def answer_security_questions(tab) -> None:
     answers = [require("USVISA_Q1"), require("USVISA_Q2"), require("USVISA_Q3")]
 
+    _log("checking for security question form ...")
+    await _log_page_state(tab, "security questions check")
+
     # Wait up to 20 s for the form to appear
-    for _ in range(4):
+    found_count = 0
+    for attempt in range(4):
         count = await tab.evaluate(
             "document.querySelectorAll('input[type=text]').length"
         )
-        if count and int(count) >= 3:
+        found_count = int(count) if count else 0
+        _log(f"security form poll {attempt+1}/4: found {found_count} text input(s)")
+        if found_count >= 3:
             break
         await asyncio.sleep(5.0)
     else:
-        print("[monitor] security question form not found — skipping")
+        _log("security question form not found — skipping")
+        await _log_page_state(tab, "no security form")
         return
 
-    print("[monitor] answering security questions")
+    _log("answering security questions")
     answers_json = json.dumps(answers)
     await tab.evaluate(f"""
         (() => {{
@@ -472,29 +578,36 @@ async def answer_security_questions(tab) -> None:
     """)
     await asyncio.sleep(0.5)
 
-    if not await _click(tab, ["button[type='submit']", "input[type='submit']"]):
-        await _click_by_text(tab, r"submit|continue|next")
+    clicked_sq = await _click(tab, ["button[type='submit']", "input[type='submit']"])
+    if not clicked_sq:
+        clicked_sq = await _click_by_text(tab, r"submit|continue|next")
+    _log(f"security questions submit clicked: {clicked_sq}")
 
     await asyncio.sleep(3.0)
-    print("[monitor] security questions submitted")
+    await _log_page_state(tab, "after security questions")
+    _log("security questions submitted")
 
 
 # ─── reschedule navigation ────────────────────────────────────────────────────
 
 async def goto_reschedule(tab) -> None:
     link_text = env("RESCHEDULE_LINK_TEXT", "Reschedule Appointment")
-    print(f"[monitor] looking for '{link_text}' link ...")
+    _log(f"looking for '{link_text}' link ...")
+    await _log_page_state(tab, "before reschedule nav")
 
     # nodriver text search
     try:
         el = await tab.find(link_text, best_match=True)
         if el:
+            _log(f"found '{link_text}' element — clicking")
             await el.click()
             await asyncio.sleep(3.0)
+            await _log_page_state(tab, "after reschedule click")
             return
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(f"nodriver find failed: {exc}")
 
+    _log("trying JS fallback to find reschedule link")
     # JS fallback
     found = await tab.evaluate("""
         (() => {
@@ -508,12 +621,14 @@ async def goto_reschedule(tab) -> None:
         })()
     """)
     if not found:
+        await _log_page_state(tab, "reschedule link NOT found")
         raise RuntimeError(
             "Reschedule Appointment link not found. "
             "Check that login succeeded or set RESCHEDULE_LINK_TEXT."
         )
     await asyncio.sleep(3.0)
-    print("[monitor] on reschedule page")
+    await _log_page_state(tab, "reschedule page")
+    _log("on reschedule page")
 
 
 # ─── post / consulate dropdown ────────────────────────────────────────────────
@@ -532,6 +647,7 @@ _DROPDOWN_SELECTORS = [
 
 
 async def find_dropdown_selector(tab) -> Optional[str]:
+    _log("probing for OFC/consulate dropdown ...")
     for sel in _DROPDOWN_SELECTORS:
         try:
             el = await tab.select(sel)
@@ -540,7 +656,10 @@ async def find_dropdown_selector(tab) -> Optional[str]:
             count = await tab.evaluate(
                 f"document.querySelector('{sel}').options.length"
             )
-            if count and int(count) > 1:
+            cnt = int(count) if count else 0
+            _log(f"  selector '{sel}': {cnt} option(s)")
+            if cnt > 1:
+                _log(f"  -> using selector: {sel}")
                 return sel
         except Exception:
             continue
@@ -718,8 +837,13 @@ async def scan_calendar_dates(tab, max_months: int = 12) -> List[str]:
     seen_labels: set = set()
 
     for month_idx in range(max_months):
+        # Read month label first (for logging)
+        label = (await tab.evaluate(_JS_MONTH_LABEL) or "").strip()
+        _log(f"  calendar month {month_idx+1}: '{label}'")
+
         # Collect available dates on the current calendar view
         raw = await tab.evaluate(_JS_COLLECT_DATES)
+        month_new: List[str] = []
         if raw and raw != "null":
             try:
                 raw_dates = json.loads(raw)
@@ -727,14 +851,15 @@ async def scan_calendar_dates(tab, max_months: int = 12) -> List[str]:
                     d = _extract_date(rd) or (rd if _parse_date(rd) else None)
                     if d and d not in all_dates:
                         all_dates.append(d)
+                        month_new.append(d)
             except (json.JSONDecodeError, ValueError):
                 pass
+        _log(f"  calendar month {month_idx+1}: {len(month_new)} new date(s) found{': ' + str(month_new[:5]) if month_new else ''}")
 
-        # Read month label to detect a stalled calendar
-        label = (await tab.evaluate(_JS_MONTH_LABEL) or "").strip()
+        # Detect stalled calendar
         if label:
             if label in seen_labels:
-                # Calendar is no longer advancing — stop
+                _log(f"  calendar stalled at '{label}' — stopping")
                 break
             seen_labels.add(label)
 
@@ -742,7 +867,7 @@ async def scan_calendar_dates(tab, max_months: int = 12) -> List[str]:
         advanced = await tab.evaluate(_JS_NEXT_MONTH)
         if not advanced:
             if month_idx == 0:
-                print("[monitor]   (single-month calendar — no next-month button)")
+                _log("  (single-month calendar — no next-month button)")
             break
         await asyncio.sleep(0.8)
 
@@ -752,7 +877,7 @@ async def scan_calendar_dates(tab, max_months: int = 12) -> List[str]:
 async def scan_post(tab, dropdown_sel: str, value: str, label: str) -> SlotResult:
     """Select one post in the dropdown and return its earliest available slot."""
     result = SlotResult(post=label)
-    print(f"[monitor]   -> {label!r} ...", end=" ", flush=True)
+    _log(f"scanning post: {label!r} (value={value!r})")
 
     await select_post(tab, dropdown_sel, value)
 
@@ -778,22 +903,25 @@ async def scan_post(tab, dropdown_sel: str, value: str, label: str) -> SlotResul
             result.earliest = d
             result.all_dates = [d]
             result.status = "ok"
-            print(d)
+            _log(f"  {label!r}: earliest (inline) = {d}")
             return result
 
     # Full calendar scan
-    dates = await scan_calendar_dates(tab, int(env("CALENDAR_MONTHS", "12")))
+    max_months = int(env("CALENDAR_MONTHS", "12"))
+    _log(f"  {label!r}: scanning calendar (up to {max_months} months) ...")
+    dates = await scan_calendar_dates(tab, max_months)
 
+    _log(f"  {label!r}: raw dates found: {dates}")
     if dates:
         pairs = [(d, _parse_date(d)) for d in dates if _parse_date(d)]
         pairs.sort(key=lambda x: x[1])  # type: ignore[arg-type]
         result.all_dates = [d for d, _ in pairs]
         result.earliest = pairs[0][0]
         result.status = "ok"
-        print(result.earliest)
+        _log(f"  {label!r}: earliest = {result.earliest}")
     else:
         result.status = "no dates found"
-        print("none")
+        _log(f"  {label!r}: no available dates found")
 
     return result
 
@@ -816,9 +944,9 @@ def send_telegram(text: str) -> None:
     try:
         with request.urlopen(req, timeout=20) as resp:
             json.loads(resp.read())
-        print("[monitor] Telegram notification sent")
+        _log("Telegram notification sent")
     except Exception as exc:
-        print(f"[monitor] Telegram error: {exc}")
+        _log(f"Telegram error: {exc}")
 
 
 def build_report(results: List[SlotResult]) -> Tuple[str, Optional[SlotResult]]:
@@ -877,20 +1005,32 @@ async def try_auto_book(tab, best: Optional[SlotResult]) -> str:
 # ─── main flow ────────────────────────────────────────────────────────────────
 
 async def run() -> None:
+    chrome = _find_chrome()
+    profile = _get_profile_dir()
+    _log(f"=== US Visa Slot Monitor starting ===")
+    _log(f"Chrome  : {chrome}")
+    _log(f"Profile : {profile}")
+    _log(f"Site    : {BASE_URL}")
+
     browser = await uc.start(
-        browser_executable_path=_find_chrome(),
+        browser_executable_path=chrome,
         headless=False,
-        user_data_dir=_get_profile_dir(),
+        user_data_dir=profile,
         no_sandbox=True,
     )
+    _log("Chrome launched")
     try:
+        _log(f"Navigating to {BASE_URL} ...")
         tab = await browser.get(BASE_URL)
         await asyncio.sleep(2.0)
+        await _log_page_state(tab, "initial load")
 
         # ── Phase 1: clear Cloudflare gating ──────────────────────────────────
+        _log("--- Phase 1: Cloudflare guard ---")
         await cf_guard(tab)
 
         # ── Phase 2: login ────────────────────────────────────────────────────
+        _log("--- Phase 2: Login ---")
         await wait_for_login_page(tab)
         await perform_login(tab)
         await answer_security_questions(tab)
@@ -898,12 +1038,15 @@ async def run() -> None:
         await cf_guard(tab)
 
         # ── Phase 3: reschedule page ──────────────────────────────────────────
+        _log("--- Phase 3: Navigate to Reschedule ---")
         await goto_reschedule(tab)
         await asyncio.sleep(2.0)
 
         # ── Phase 4: find the OFC/consulate dropdown ──────────────────────────
+        _log("--- Phase 4: Find post dropdown ---")
         dropdown_sel = await find_dropdown_selector(tab)
         if not dropdown_sel:
+            await _log_page_state(tab, "no dropdown found")
             raise RuntimeError(
                 "OFC/consulate dropdown not found on the reschedule page. "
                 "The page layout may have changed."
@@ -913,8 +1056,8 @@ async def run() -> None:
         if not options:
             raise RuntimeError("Dropdown found but it contains no options.")
 
-        print(
-            f"[monitor] found {len(options)} posts in dropdown: "
+        _log(
+            f"found {len(options)} posts in dropdown: "
             f"{[lbl for _, lbl in options]}"
         )
 
@@ -928,16 +1071,19 @@ async def run() -> None:
             ]
             if filtered:
                 options = filtered
+                _log(f"USVISA_POSTS filter applied: {[lbl for _, lbl in options]}")
             else:
-                print("[monitor] USVISA_POSTS filter matched nothing — scanning all posts")
+                _log("USVISA_POSTS filter matched nothing — scanning all posts")
 
         # ── Phase 5: scan every post ──────────────────────────────────────────
-        print(f"[monitor] scanning {len(options)} post(s) ...")
+        _log(f"--- Phase 5: Scan {len(options)} post(s) ---")
         results: List[SlotResult] = []
-        for value, label in options:
+        for i, (value, label) in enumerate(options, 1):
+            _log(f"post {i}/{len(options)}: {label!r}")
             results.append(await scan_post(tab, dropdown_sel, value, label))
 
         # ── Phase 6: report & notify ──────────────────────────────────────────
+        _log("--- Phase 6: Build report ---")
         report, best = build_report(results)
         booking_note = await try_auto_book(tab, best)
 
@@ -950,8 +1096,10 @@ async def run() -> None:
 
         telegram_text = report + (f"\n\n{booking_note}" if booking_note else "")
         send_telegram(telegram_text)
+        _log("=== Done ===")
 
     finally:
+        _log("closing browser")
         browser.stop()
 
 
