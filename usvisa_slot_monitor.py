@@ -301,6 +301,16 @@ async def _cf_iframe_rect(tab) -> Optional[dict]:
     return None
 
 
+async def _has_turnstile_iframe(tab) -> bool:
+    """Return True when a Cloudflare challenge iframe is present."""
+    try:
+        return bool(await tab.evaluate(
+            "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"], iframe[src*=\"cdn-cgi/challenge\"]')"
+        ))
+    except Exception:
+        return False
+
+
 async def solve_turnstile(tab, timeout: int = 60) -> None:
     """
     Handle a Cloudflare Turnstile CHECKBOX widget on the current page.
@@ -311,9 +321,7 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
     """
     # Only trigger on a real Turnstile iframe — NOT on bare window.turnstile
     # which is injected on every CF-protected page regardless of widget type.
-    iframe_present = await tab.evaluate(
-        "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')"
-    )
+    iframe_present = await _has_turnstile_iframe(tab)
     if not iframe_present:
         return  # no checkbox widget — nothing to click
 
@@ -367,12 +375,37 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
 
 async def _is_cf_challenge(tab) -> bool:
     """Return True if the page is any Cloudflare challenge (JS check, Turnstile, waiting room)."""
+    if await _has_turnstile_iframe(tab):
+        return True
+
+    url = (await _page_url(tab)).lower()
+    if any(part in url for part in [
+        "challenges.cloudflare.com",
+        "/cdn-cgi/challenge",
+        "/cdn-cgi/challenge-platform",
+    ]):
+        return True
+
     title = (await _page_title(tab)).lower()
-    if "just a moment" in title:
+    if any(phrase in title for phrase in [
+        "just a moment",
+        "attention required",
+        "one more step",
+        "please wait",
+    ]):
         return True
+
     text = await _page_text(tab)
-    if "performing security verification" in text:
+    if any(phrase in text for phrase in [
+        "performing security verification",
+        "security check",
+        "verify you are human",
+        "checking your browser",
+        "enable javascript and cookies",
+        "malicious",
+    ]):
         return True
+
     return await _is_waiting_room(tab)
 
 
@@ -386,6 +419,10 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     3. Turnstile checkbox widget  — we click it
     """
     await handle_waiting_room(tab)
+
+    # The managed/malicious-check variant can show only the checkbox iframe,
+    # so attempt Turnstile handling before generic challenge checks.
+    await solve_turnstile(tab)
 
     # If already past any challenge, return immediately
     if not await _is_cf_challenge(tab):

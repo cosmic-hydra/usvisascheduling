@@ -437,7 +437,61 @@ class TestWaitingRoomDetection(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Auto-book gating
+# 8. Cloudflare challenge detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCloudflareChallengeDetection(unittest.TestCase):
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _make_tab(
+        self,
+        text="",
+        url="https://example.com",
+        title="",
+        has_cf_iframe=False,
+        has_waiting_room=False,
+    ):
+        tab = MagicMock()
+
+        async def _eval(js):
+            if "innerText" in js:
+                return text.lower()
+            if "location.href" in js:
+                return url
+            if "document.title" in js:
+                return title
+            if "iframe[src*=\"challenges.cloudflare.com\"]" in js:
+                return has_cf_iframe
+            if "waiting room" in js or "queue position" in js:
+                return text.lower() if has_waiting_room else ""
+            return None
+
+        tab.evaluate = AsyncMock(side_effect=_eval)
+        return tab
+
+    def test_detects_malicious_text(self):
+        tab = self._make_tab(
+            text="our systems have detected potentially malicious traffic",
+            title="Attention Required! | Cloudflare",
+        )
+        result = self._run(MON._is_cf_challenge(tab))
+        self.assertTrue(result)
+
+    def test_detects_cloudflare_challenge_iframe(self):
+        tab = self._make_tab(has_cf_iframe=True)
+        result = self._run(MON._is_cf_challenge(tab))
+        self.assertTrue(result)
+
+    def test_detects_cdn_cgi_challenge_url(self):
+        tab = self._make_tab(url="https://example.com/cdn-cgi/challenge-platform/h/b")
+        result = self._run(MON._is_cf_challenge(tab))
+        self.assertTrue(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Auto-book gating
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAutoBook(unittest.TestCase):
@@ -473,7 +527,7 @@ class TestAutoBook(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. _ask helper (prompt logic, non-interactive path)
+# 10. _ask helper (prompt logic, non-interactive path)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAskHelper(unittest.TestCase):
@@ -532,6 +586,7 @@ if __name__ == "__main__":
         TestBuildReport,
         TestEnvHelpers,
         TestWaitingRoomDetection,
+        TestCloudflareChallengeDetection,
         TestAutoBook,
         TestAskHelper,
     ]
