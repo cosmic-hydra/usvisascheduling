@@ -369,6 +369,46 @@ async def _has_turnstile_iframe(tab) -> bool:
         return False
 
 
+async def _security_checkbox_point(tab) -> tuple:
+    """Best-effort click target for security verification pages."""
+    point = await tab.evaluate("""
+        (() => {
+            const pick = (el) => {
+                if (!el || !el.getBoundingClientRect) return null;
+                const r = el.getBoundingClientRect();
+                if (r.width < 18 || r.height < 18) return null;
+                const leftBias = Math.min(36, Math.max(20, r.width * 0.22));
+                return {x: r.x + leftBias, y: r.y + (r.height / 2)};
+            };
+
+            for (const sel of [
+                'iframe',
+                '[role="checkbox"]',
+                'input[type="checkbox"]',
+                '[id*="turnstile"]',
+                '[class*="turnstile"]',
+                '[id*="challenge"]',
+                '[class*="challenge"]'
+            ]) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const p = pick(el);
+                    if (p) return p;
+                }
+            }
+
+            const w = window.innerWidth || 1280;
+            const h = window.innerHeight || 900;
+            return {x: Math.max(40, Math.min(w - 40, w * 0.22)), y: Math.max(60, Math.min(h - 60, h * 0.42))};
+        })()
+    """)
+    if isinstance(point, dict) and "x" in point and "y" in point:
+        try:
+            return (float(point["x"]), float(point["y"]))
+        except (TypeError, ValueError):
+            pass
+    return (280.0, 380.0)
+
+
 async def solve_turnstile(tab, timeout: int = 60) -> None:
     """
     Handle a Cloudflare Turnstile CHECKBOX widget on the current page.
@@ -380,10 +420,14 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
     # Only trigger on a real Turnstile iframe — NOT on bare window.turnstile
     # which is injected on every CF-protected page regardless of widget type.
     iframe_present = await _has_turnstile_iframe(tab)
-    if not iframe_present:
+    security_page = await _is_security_verification_page(tab)
+    if not iframe_present and not security_page:
         return  # no checkbox widget — nothing to click
 
-    _log("Cloudflare Turnstile checkbox widget detected — solving ...")
+    if iframe_present:
+        _log("Cloudflare Turnstile checkbox widget detected — solving ...")
+    else:
+        _log("security verification challenge detected without explicit iframe — using fallback click targeting")
     await _log_page_state(tab, "turnstile")
 
     async def is_confirmed() -> bool:
@@ -442,11 +486,9 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
                     await asyncio.sleep(0.4)
             else:
                 # Last-resort click for opaque challenge layouts where iframe rect cannot be read.
-                viewport = await tab.evaluate("({w: window.innerWidth || 1280, h: window.innerHeight || 900})")
-                vw = float((viewport or {}).get("w", 1280))
-                vh = float((viewport or {}).get("h", 900))
-                cx = min(max(vw * 0.22, 40), vw - 40) + random.uniform(-2, 2)
-                cy = min(max(vh * 0.42, 60), vh - 60) + random.uniform(-2, 2)
+                px, py = await _security_checkbox_point(tab)
+                cx = px + random.uniform(-2, 2)
+                cy = py + random.uniform(-2, 2)
                 _log(f"iframe rect unavailable — fallback click at ({cx:.0f}, {cy:.0f})")
                 await tab.mouse_move(cx - 40, cy - 10)
                 await asyncio.sleep(random.uniform(0.12, 0.2))

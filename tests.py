@@ -538,6 +538,23 @@ class TestSecurityVerificationPage(unittest.TestCase):
         tab = self._make_tab("Welcome to dashboard")
         self.assertFalse(self._run(MON._is_security_verification_page(tab)))
 
+class TestSecurityCheckboxPoint(unittest.TestCase):
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_uses_dom_point_when_available(self):
+        tab = MagicMock()
+        tab.evaluate = AsyncMock(return_value={"x": 120, "y": 260})
+        x, y = self._run(MON._security_checkbox_point(tab))
+        self.assertEqual((x, y), (120.0, 260.0))
+
+    def test_fallback_when_bad_payload(self):
+        tab = MagicMock()
+        tab.evaluate = AsyncMock(return_value="bad")
+        x, y = self._run(MON._security_checkbox_point(tab))
+        self.assertEqual((x, y), (280.0, 380.0))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. Auto-book gating
@@ -638,6 +655,7 @@ if __name__ == "__main__":
         TestCloudflareChallengeDetection,
         TestChallengeIframeRect,
         TestSecurityVerificationPage,
+        TestSecurityCheckboxPoint,
         TestAutoBook,
         TestAskHelper,
     ]
