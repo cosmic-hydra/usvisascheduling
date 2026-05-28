@@ -456,14 +456,14 @@ class TestCloudflareChallengeDetection(unittest.TestCase):
         tab = MagicMock()
 
         async def _eval(js):
+            if "looksLikeCfFrame" in js or "iframe[src*=\"challenges.cloudflare.com\"]" in js:
+                return has_cf_iframe
             if "innerText" in js:
                 return text.lower()
             if "location.href" in js:
                 return url
             if "document.title" in js:
                 return title
-            if "iframe[src*=\"challenges.cloudflare.com\"]" in js:
-                return has_cf_iframe
             if "waiting room" in js or "queue position" in js:
                 return text.lower() if has_waiting_room else ""
             return None
@@ -488,6 +488,55 @@ class TestCloudflareChallengeDetection(unittest.TestCase):
         tab = self._make_tab(url="https://example.com/cdn-cgi/challenge-platform/h/b")
         result = self._run(MON._is_cf_challenge(tab))
         self.assertTrue(result)
+
+
+class TestChallengeIframeRect(unittest.TestCase):
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_parses_challenges_cloudflare_rect(self):
+        tab = MagicMock()
+        tab.evaluate = AsyncMock(return_value='{"x":10,"y":20,"w":300,"h":120}')
+        rect = self._run(MON._cf_iframe_rect(tab))
+        self.assertEqual(rect, {"x": 10, "y": 20, "w": 300, "h": 120})
+
+    def test_parses_cdn_cgi_challenge_rect(self):
+        tab = MagicMock()
+        tab.evaluate = AsyncMock(return_value='{"x":30,"y":40,"w":280,"h":90}')
+        rect = self._run(MON._cf_iframe_rect(tab))
+        self.assertEqual(rect, {"x": 30, "y": 40, "w": 280, "h": 90})
+
+    def test_returns_none_for_invalid_payload(self):
+        tab = MagicMock()
+        tab.evaluate = AsyncMock(return_value='not-json')
+        rect = self._run(MON._cf_iframe_rect(tab))
+        self.assertIsNone(rect)
+
+
+class TestSecurityVerificationPage(unittest.TestCase):
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _make_tab(self, text):
+        tab = MagicMock()
+
+        async def _eval(js):
+            if "innerText" in js:
+                return text.lower()
+            return ""
+
+        tab.evaluate = AsyncMock(side_effect=_eval)
+        return tab
+
+    def test_detects_security_verification_text(self):
+        tab = self._make_tab("This website is performing security verification")
+        self.assertTrue(self._run(MON._is_security_verification_page(tab)))
+
+    def test_non_security_page_returns_false(self):
+        tab = self._make_tab("Welcome to dashboard")
+        self.assertFalse(self._run(MON._is_security_verification_page(tab)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -587,6 +636,8 @@ if __name__ == "__main__":
         TestEnvHelpers,
         TestWaitingRoomDetection,
         TestCloudflareChallengeDetection,
+        TestChallengeIframeRect,
+        TestSecurityVerificationPage,
         TestAutoBook,
         TestAskHelper,
     ]

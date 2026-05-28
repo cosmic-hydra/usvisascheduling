@@ -17,11 +17,12 @@ import sys
 import json
 import urllib.request
 import urllib.error
+from typing import Tuple
 
 SERVICE_URL = "http://127.0.0.1:8191/solve"
 
 
-def request_token(sitekey: str, siteurl: str, timeout: int = 45) -> str:
+def request_token(sitekey: str, siteurl: str, timeout: int = 45) -> Tuple[str, float]:
     payload = json.dumps({
         "sitekey": sitekey,
         "siteurl": siteurl,
@@ -39,8 +40,12 @@ def request_token(sitekey: str, siteurl: str, timeout: int = 45) -> str:
         with urllib.request.urlopen(req, timeout=timeout + 20) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        data = json.loads(e.read())
-        raise RuntimeError(data.get("error", str(e)))
+        body = e.read()
+        try:
+            data = json.loads(body)
+            raise RuntimeError(data.get("error", str(e)))
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {e.code}: {body.decode(errors='replace')}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Cannot reach service at {SERVICE_URL}: {e.reason}")
 

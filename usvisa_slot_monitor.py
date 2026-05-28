@@ -283,13 +283,41 @@ async def handle_waiting_room(tab) -> None:
 async def _cf_iframe_rect(tab) -> Optional[dict]:
     raw = await tab.evaluate("""
         JSON.stringify((() => {
+            const looksLikeCfFrame = (f) => {
+                const src = (f.src || '').toLowerCase();
+                const title = (f.title || '').toLowerCase();
+                const id = (f.id || '').toLowerCase();
+                const name = (f.name || '').toLowerCase();
+                const attrs = [src, title, id, name].join(' ');
+                return attrs.includes('challenges.cloudflare.com')
+                    || attrs.includes('/cdn-cgi/challenge')
+                    || attrs.includes('turnstile')
+                    || attrs.includes('cloudflare');
+            };
+
             for (const f of document.querySelectorAll('iframe')) {
-                const src = f.src || '';
-                if (!src.includes('challenges.cloudflare.com')) continue;
+                if (!looksLikeCfFrame(f)) continue;
                 const r = f.getBoundingClientRect();
                 if (r.width > 20 && r.height > 10)
                     return {x: r.x, y: r.y, w: r.width, h: r.height};
             }
+
+            // Some challenge variants use transient/opaque iframe attributes.
+            // On security verification pages, fall back to the first visible iframe.
+            const body = ((document.body && document.body.innerText) || '').toLowerCase();
+            const looksLikeSecurityPage = body.includes('security verification')
+                || body.includes('verify you are human')
+                || body.includes('checking your browser')
+                || body.includes('malicious');
+
+            if (looksLikeSecurityPage) {
+                for (const f of document.querySelectorAll('iframe')) {
+                    const r = f.getBoundingClientRect();
+                    if (r.width > 100 && r.height > 40)
+                        return {x: r.x, y: r.y, w: r.width, h: r.height};
+                }
+            }
+
             return null;
         })())
     """)
@@ -305,7 +333,37 @@ async def _has_turnstile_iframe(tab) -> bool:
     """Return True when a Cloudflare challenge iframe is present."""
     try:
         return bool(await tab.evaluate(
-            "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"], iframe[src*=\"cdn-cgi/challenge\"]')"
+            """
+            (() => {
+                const looksLikeCfFrame = (f) => {
+                    const src = (f.src || '').toLowerCase();
+                    const title = (f.title || '').toLowerCase();
+                    const id = (f.id || '').toLowerCase();
+                    const name = (f.name || '').toLowerCase();
+                    const attrs = [src, title, id, name].join(' ');
+                    return attrs.includes('challenges.cloudflare.com')
+                        || attrs.includes('/cdn-cgi/challenge')
+                        || attrs.includes('turnstile')
+                        || attrs.includes('cloudflare');
+                };
+
+                const frames = Array.from(document.querySelectorAll('iframe'));
+                if (frames.some(looksLikeCfFrame)) return true;
+
+                const body = ((document.body && document.body.innerText) || '').toLowerCase();
+                const looksLikeSecurityPage = body.includes('security verification')
+                    || body.includes('verify you are human')
+                    || body.includes('checking your browser')
+                    || body.includes('malicious');
+
+                // Fallback for challenge pages with opaque iframe attributes.
+                if (!looksLikeSecurityPage) return false;
+                return frames.some(f => {
+                    const r = f.getBoundingClientRect();
+                    return r.width > 100 && r.height > 40;
+                });
+            })()
+            """
         ))
     except Exception:
         return False
@@ -327,12 +385,9 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
 
     _log("Cloudflare Turnstile checkbox widget detected — solving ...")
     await _log_page_state(tab, "turnstile")
-    deadline = asyncio.get_event_loop().time() + timeout
-    clicks = 0
-    last_click = 0.0
 
-    while asyncio.get_event_loop().time() < deadline:
-        # Check for token (invisible widget may have auto-solved)
+    async def is_confirmed() -> bool:
+        # 1) Token present
         token = await tab.evaluate("""
             (() => {
                 const el = document.querySelector('[name="cf-turnstile-response"]');
@@ -340,15 +395,25 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
             })()
         """)
         if token:
-            _log("Turnstile solved (token obtained)")
-            return
+            return True
 
-        # iframe gone → challenge passed / page navigated
-        still_there = await tab.evaluate(
-            "!!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')"
-        )
-        if not still_there:
-            _log("Turnstile iframe gone — challenge passed")
+        # 2) Challenge iframe removed
+        if not await _has_turnstile_iframe(tab):
+            return True
+
+        # 3) Challenge page no longer active
+        if not await _is_cf_challenge(tab):
+            return True
+
+        return False
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    clicks = 0
+    last_click = 0.0
+
+    while asyncio.get_event_loop().time() < deadline:
+        if await is_confirmed():
+            _log("Turnstile confirmed")
             return
 
         # Click the checkbox (retry up to 4 times, every 10 s)
@@ -356,7 +421,8 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
         if clicks == 0 or (now - last_click > 10 and clicks < 4):
             rect = await _cf_iframe_rect(tab)
             if rect:
-                cx = rect["x"] + 28 + random.uniform(-3, 3)
+                # Cloudflare checkbox sits on the left side of the challenge iframe.
+                cx = rect["x"] + min(36, max(20, rect["w"] * 0.22)) + random.uniform(-3, 3)
                 cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
                 _log(f"clicking Turnstile checkbox at ({cx:.0f}, {cy:.0f})")
                 await tab.mouse_move(cx - 60, cy - 15)
@@ -366,6 +432,36 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
                 await tab.mouse_click(cx, cy)
                 last_click = asyncio.get_event_loop().time()
                 clicks += 1
+
+                # Wait briefly for challenge confirmation after each click.
+                confirm_deadline = asyncio.get_event_loop().time() + 12
+                while asyncio.get_event_loop().time() < confirm_deadline:
+                    if await is_confirmed():
+                        _log("Turnstile confirmed after click")
+                        return
+                    await asyncio.sleep(0.4)
+            else:
+                # Last-resort click for opaque challenge layouts where iframe rect cannot be read.
+                viewport = await tab.evaluate("({w: window.innerWidth || 1280, h: window.innerHeight || 900})")
+                vw = float((viewport or {}).get("w", 1280))
+                vh = float((viewport or {}).get("h", 900))
+                cx = min(max(vw * 0.22, 40), vw - 40) + random.uniform(-2, 2)
+                cy = min(max(vh * 0.42, 60), vh - 60) + random.uniform(-2, 2)
+                _log(f"iframe rect unavailable — fallback click at ({cx:.0f}, {cy:.0f})")
+                await tab.mouse_move(cx - 40, cy - 10)
+                await asyncio.sleep(random.uniform(0.12, 0.2))
+                await tab.mouse_move(cx, cy)
+                await asyncio.sleep(random.uniform(0.06, 0.12))
+                await tab.mouse_click(cx, cy)
+                last_click = asyncio.get_event_loop().time()
+                clicks += 1
+
+                confirm_deadline = asyncio.get_event_loop().time() + 12
+                while asyncio.get_event_loop().time() < confirm_deadline:
+                    if await is_confirmed():
+                        _log("Turnstile confirmed after click")
+                        return
+                    await asyncio.sleep(0.4)
 
         await asyncio.sleep(0.5)
 
@@ -409,6 +505,12 @@ async def _is_cf_challenge(tab) -> bool:
     return await _is_waiting_room(tab)
 
 
+async def _is_security_verification_page(tab) -> bool:
+    """Return True on the Cloudflare security-verification interstitial."""
+    text = await _page_text(tab)
+    return "performing security verification" in text
+
+
 async def cf_guard(tab, timeout: int = 90) -> None:
     """
     Wait until all Cloudflare challenges clear.
@@ -420,9 +522,17 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     """
     await handle_waiting_room(tab)
 
-    # The managed/malicious-check variant can show only the checkbox iframe,
-    # so attempt Turnstile handling before generic challenge checks.
+    # The managed/malicious-check variant can show only the checkbox iframe.
+    # Delay first click a bit on verification interstitials to mimic real user behavior.
+    click_delay = float(env("CF_CLICK_DELAY_SECONDS", "6"))
+    last_solve_attempt = 0.0
+
+    if await _is_security_verification_page(tab) and await _has_turnstile_iframe(tab):
+        _log(f"security verification page detected — waiting {click_delay:.0f}s before checkbox click")
+        await asyncio.sleep(click_delay)
+
     await solve_turnstile(tab)
+    last_solve_attempt = asyncio.get_event_loop().time()
 
     # If already past any challenge, return immediately
     if not await _is_cf_challenge(tab):
@@ -433,8 +543,11 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     poll = 0
     while asyncio.get_event_loop().time() < deadline:
-        # If a Turnstile checkbox has appeared, click it
-        await solve_turnstile(tab)
+        # Avoid repeatedly re-solving every poll; retry only on cooldown.
+        now = asyncio.get_event_loop().time()
+        if await _has_turnstile_iframe(tab) and (now - last_solve_attempt >= 20):
+            await solve_turnstile(tab)
+            last_solve_attempt = asyncio.get_event_loop().time()
 
         if not await _is_cf_challenge(tab):
             _log("CF challenge cleared")

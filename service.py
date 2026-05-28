@@ -26,10 +26,25 @@ import json
 from solver import solve
 
 
-PORT = int(os.environ.get("PORT", 8191))
+def _env_int(name: str, default: int, min_value: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[service] invalid {name}={raw!r}; using {default}")
+        return default
+    if value < min_value:
+        print(f"[service] {name} must be >= {min_value}; using {default}")
+        return default
+    return value
+
+
+PORT = _env_int("PORT", 8191, 1)
 # How many Chrome instances to run in parallel.
 # Rule of thumb: ~500 MB RAM per worker. 4 workers = ~2 GB.
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
+MAX_WORKERS = _env_int("MAX_WORKERS", 4, 1)
 
 # Semaphore caps concurrent Chrome instances; threads above the limit
 # block here (queued) until a slot opens — no requests are dropped.
@@ -50,11 +65,16 @@ def _ensure_display() -> Optional[subprocess.Popen]:
         return None
     if os.environ.get("DISPLAY"):
         return None
-    xvfb = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1280x900x24"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        xvfb = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x900x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "DISPLAY is not set and Xvfb is not installed. Install it with: sudo apt install xvfb"
+        ) from exc
     os.environ["DISPLAY"] = ":99"
     time.sleep(0.5)
     print("[service] started Xvfb on :99")
@@ -89,7 +109,15 @@ class Handler(BaseHTTPRequestHandler):
 
         sitekey = payload.get("sitekey", "").strip()
         siteurl = payload.get("siteurl", "").strip()
-        timeout = int(payload.get("timeout", 45))
+        timeout_raw = payload.get("timeout", 45)
+        try:
+            timeout = int(timeout_raw)
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "timeout must be an integer"})
+            return
+        if timeout < 1:
+            self.send_json(400, {"error": "timeout must be >= 1"})
+            return
 
         if not sitekey or not siteurl:
             self.send_json(400, {"error": "sitekey and siteurl are required"})
@@ -140,7 +168,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    xvfb_proc = _ensure_display()
+    try:
+        xvfb_proc = _ensure_display()
+    except RuntimeError as exc:
+        print(f"[service] startup error: {exc}")
+        raise SystemExit(1)
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[service] Turnstile solver service running on http://0.0.0.0:{PORT}")
     print(f"[service] worker pool: {MAX_WORKERS} concurrent Chrome instances "

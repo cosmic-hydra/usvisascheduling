@@ -45,11 +45,16 @@ def _find_chrome() -> str:
 def _get_profile_dir() -> str:
     """Return a persistent Chrome profile directory for the current OS."""
     if os.environ.get("TS_PROFILE_DIR"):
-        return os.environ["TS_PROFILE_DIR"]
+        profile_dir = os.environ["TS_PROFILE_DIR"]
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
     if platform.system() == "Windows":
         base = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Temp"
-        return os.path.join(base, "ts_profile")
-    return "/tmp/ts_profile"
+        profile_dir = os.path.join(base, "ts_profile")
+    else:
+        profile_dir = "/tmp/ts_profile"
+    os.makedirs(profile_dir, exist_ok=True)
+    return profile_dir
 
 
 def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
@@ -58,11 +63,16 @@ def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
         return None
     if os.environ.get("DISPLAY"):
         return None
-    proc = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1280x900x24"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x900x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Xvfb is required for headless Linux without DISPLAY. Install it with: sudo apt install xvfb"
+        ) from exc
     os.environ["DISPLAY"] = ":99"
     time.sleep(0.5)
     return proc
@@ -80,6 +90,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
         # Inject widget into the live page DOM
+        sitekey_js = json.dumps(sitekey)
         await page.evaluate(f"""
             (() => {{
                 if (document.getElementById('_ts_box')) return;
@@ -90,7 +101,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
                 document.body.appendChild(wrap);
                 window._tsLoad = function () {{
                     turnstile.render('#_ts_box', {{
-                        sitekey: '{sitekey}',
+                        sitekey: {sitekey_js},
                         callback: function(token) {{ window._tsToken = token; }}
                     }});
                 }};
@@ -220,19 +231,3 @@ if __name__ == "__main__":
     finally:
         if _xvfb:
             _xvfb.terminate()
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 3:
-        print("Usage: python solver.py <sitekey> <siteurl>")
-        sys.exit(1)
-
-    xvfb = _start_xvfb_if_needed()
-    try:
-        token = solve(sys.argv[1], sys.argv[2])
-        print(token)
-    finally:
-        if xvfb:
-            xvfb.terminate()
