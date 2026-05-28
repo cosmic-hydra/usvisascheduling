@@ -62,6 +62,12 @@ from urllib import parse, request
 
 import nodriver as uc
 
+try:
+    import anthropic as _anthropic
+    _HAS_ANTHROPIC = True
+except ImportError:
+    _HAS_ANTHROPIC = False
+
 
 BASE_URL = "https://www.usvisascheduling.com/en-US"
 
@@ -409,6 +415,26 @@ async def _security_checkbox_point(tab) -> tuple:
     return (280.0, 380.0)
 
 
+async def _simulate_human_behavior(tab) -> None:
+    """Move the mouse and scroll a little so Cloudflare fingerprinting sees a human."""
+    try:
+        w = int(await tab.evaluate("window.innerWidth || 1280") or 1280)
+        h = int(await tab.evaluate("window.innerHeight || 900") or 900)
+        mx = random.randint(int(w * 0.2), int(w * 0.8))
+        my = random.randint(int(h * 0.2), int(h * 0.5))
+        await tab.mouse_move(mx, my)
+        await asyncio.sleep(random.uniform(0.3, 0.7))
+        await tab.evaluate(f"window.scrollBy(0, {random.randint(30, 100)})")
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+        await tab.mouse_move(
+            mx + random.randint(-60, 60),
+            my + random.randint(-40, 40),
+        )
+        await asyncio.sleep(random.uniform(0.2, 0.4))
+    except Exception:
+        pass
+
+
 async def solve_turnstile(tab, timeout: int = 60) -> None:
     """
     Handle a Cloudflare Turnstile CHECKBOX widget on the current page.
@@ -564,9 +590,13 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     """
     await handle_waiting_room(tab)
 
+    # Simulate human browsing before any click attempt so Cloudflare fingerprinting
+    # sees natural mouse + scroll behaviour first.
+    await _simulate_human_behavior(tab)
+
     # The managed/malicious-check variant can show only the checkbox iframe.
-    # Delay first click a bit on verification interstitials to mimic real user behavior.
-    click_delay = float(env("CF_CLICK_DELAY_SECONDS", "6"))
+    # Delay first click to mimic a real user reading the page (default raised to 8 s).
+    click_delay = float(env("CF_CLICK_DELAY_SECONDS", "8"))
     last_solve_attempt = 0.0
 
     if await _is_security_verification_page(tab) and await _has_turnstile_iframe(tab):
@@ -731,8 +761,87 @@ async def perform_login(tab) -> None:
     _log("login form submitted")
 
 
+async def _extract_question_labels(tab) -> List[str]:
+    """Read the visible label text for every text input on the page."""
+    raw = await tab.evaluate("""
+        JSON.stringify((() => {
+            return Array.from(document.querySelectorAll('input[type=text]')).map(inp => {
+                const id = inp.id || '';
+                let label = '';
+                if (id) {
+                    const lbl = document.querySelector('label[for="' + id + '"]');
+                    if (lbl) label = lbl.innerText.trim();
+                }
+                if (!label) {
+                    let el = inp.parentElement;
+                    for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
+                        const lbl = el.querySelector(
+                            'label, .label, .question, [class*="question"], p'
+                        );
+                        if (lbl && lbl.innerText.trim() && !lbl.querySelector('input')) {
+                            label = lbl.innerText.trim();
+                            break;
+                        }
+                    }
+                }
+                return label || inp.placeholder || inp.name || inp.id || '';
+            });
+        })())
+    """)
+    if raw and raw != "null":
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return []
+
+
+def _ai_match_answers(questions: List[str], stored: List[str]) -> List[str]:
+    """
+    Use Claude to route each stored answer to the question it most likely answers.
+    Falls back to sequential assignment if the API key is absent or the call fails.
+    """
+    if not _HAS_ANTHROPIC:
+        _log("anthropic not installed — sequential answer assignment")
+        return stored[: len(questions)]
+
+    api_key = env("ANTHROPIC_API_KEY")
+    if not api_key:
+        _log("ANTHROPIC_API_KEY not set — sequential answer assignment")
+        return stored[: len(questions)]
+
+    try:
+        client = _anthropic.Anthropic(api_key=api_key)
+        q_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        a_text = "\n".join(f"Answer {i + 1}: {a}" for i, a in enumerate(stored))
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Match each stored answer to the question it most likely answers. "
+                    "Return ONLY a JSON array of answer strings in question order.\n\n"
+                    f"Questions:\n{q_text}\n\n"
+                    f"Stored answers:\n{a_text}\n\n"
+                    'Reply with ONLY a JSON array like: ["ans1", "ans2", "ans3"]'
+                ),
+            }],
+        )
+        response = msg.content[0].text.strip()
+        m = re.search(r"\[.*?\]", response, re.DOTALL)
+        if m:
+            matched = json.loads(m.group())
+            _log(f"AI matched: {list(zip(questions, matched))}")
+            return matched
+    except Exception as exc:
+        _log(f"AI matching failed ({exc}) — sequential assignment")
+
+    return stored[: len(questions)]
+
+
 async def answer_security_questions(tab) -> None:
-    answers = [require("USVISA_Q1"), require("USVISA_Q2"), require("USVISA_Q3")]
+    stored = [require("USVISA_Q1"), require("USVISA_Q2"), require("USVISA_Q3")]
 
     _log("checking for security question form ...")
     await _log_page_state(tab, "security questions check")
@@ -753,7 +862,15 @@ async def answer_security_questions(tab) -> None:
         await _log_page_state(tab, "no security form")
         return
 
-    _log("answering security questions")
+    # Read question labels so AI can route the right answer to the right field.
+    question_labels = await _extract_question_labels(tab)
+    _log(f"detected question labels: {question_labels}")
+    answers = _ai_match_answers(question_labels[:found_count], stored) if question_labels else stored[:found_count]
+    # Ensure we always have exactly found_count answers
+    while len(answers) < found_count:
+        answers.append(stored[len(answers)] if len(answers) < len(stored) else "")
+
+    _log(f"filling {found_count} security answers")
     answers_json = json.dumps(answers)
     await tab.evaluate(f"""
         (() => {{
@@ -778,6 +895,22 @@ async def answer_security_questions(tab) -> None:
     await asyncio.sleep(3.0)
     await _log_page_state(tab, "after security questions")
     _log("security questions submitted")
+
+
+# ─── session helpers ─────────────────────────────────────────────────────────
+
+async def _is_logged_in(tab) -> bool:
+    """Return True when the browser is on a post-login page (not login or CF)."""
+    if await _is_cf_challenge(tab):
+        return False
+    url = (await _page_url(tab)).lower()
+    if any(k in url for k in ("login", "sign-in", "signin")):
+        return False
+    text = await _page_text(tab)
+    return any(phrase in text for phrase in [
+        "reschedule", "appointment", "dashboard", "welcome",
+        "my visa", "sign out", "logout", "profile",
+    ])
 
 
 # ─── reschedule navigation ────────────────────────────────────────────────────
@@ -1196,13 +1329,83 @@ async def try_auto_book(tab, best: Optional[SlotResult]) -> str:
 
 # ─── main flow ────────────────────────────────────────────────────────────────
 
+async def _login_flow(tab) -> None:
+    """Run through CF guard → login → security questions in sequence."""
+    await cf_guard(tab)
+    await wait_for_login_page(tab)
+    await perform_login(tab)
+    await answer_security_questions(tab)
+    await asyncio.sleep(2.0)
+    await cf_guard(tab)
+
+
+async def _scan_cycle(tab, cycle: int) -> Optional[SlotResult]:
+    """
+    One full scan: reschedule page → dropdown → all posts → report.
+    Returns the best SlotResult found (or None).
+    """
+    _log(f"--- Cycle {cycle}: navigate to reschedule ---")
+    await goto_reschedule(tab)
+    await asyncio.sleep(2.0)
+
+    _log(f"--- Cycle {cycle}: find post dropdown ---")
+    dropdown_sel = await find_dropdown_selector(tab)
+    if not dropdown_sel:
+        await _log_page_state(tab, "no dropdown found")
+        raise RuntimeError(
+            "OFC/consulate dropdown not found. Page layout may have changed."
+        )
+
+    options = await get_all_options(tab, dropdown_sel)
+    if not options:
+        raise RuntimeError("Dropdown found but it contains no options.")
+
+    _log(f"found {len(options)} posts: {[lbl for _, lbl in options]}")
+
+    configured = env("USVISA_POSTS")
+    if configured:
+        want = {p.strip().lower() for p in configured.split(",") if p.strip()}
+        filtered = [
+            (v, lbl) for v, lbl in options
+            if lbl.lower() in want or v.lower() in want
+        ]
+        if filtered:
+            options = filtered
+            _log(f"USVISA_POSTS filter: {[lbl for _, lbl in options]}")
+        else:
+            _log("USVISA_POSTS matched nothing — scanning all posts")
+
+    _log(f"--- Cycle {cycle}: scan {len(options)} post(s) ---")
+    results: List[SlotResult] = []
+    for i, (value, label) in enumerate(options, 1):
+        _log(f"post {i}/{len(options)}: {label!r}")
+        results.append(await scan_post(tab, dropdown_sel, value, label))
+
+    report, best = build_report(results)
+    booking_note = await try_auto_book(tab, best)
+
+    plain = re.sub(r"<[^>]+>", "", report)
+    print("\n" + "=" * 60)
+    print(plain)
+    if booking_note:
+        print(booking_note)
+    print("=" * 60 + "\n")
+
+    return best, report, booking_note
+
+
 async def run() -> None:
     chrome = _find_chrome()
     profile = _get_profile_dir()
-    _log(f"=== US Visa Slot Monitor starting ===")
+    interval = int(env("MONITOR_INTERVAL_MINUTES", "15"))
+    # NOTIFY_ONLY_ON_IMPROVEMENT=false sends Telegram every cycle regardless.
+    notify_only_improvement = env("NOTIFY_ONLY_ON_IMPROVEMENT", "true").lower() != "false"
+
+    _log("=== US Visa Slot Monitor starting ===")
     _log(f"Chrome  : {chrome}")
     _log(f"Profile : {profile}")
     _log(f"Site    : {BASE_URL}")
+    _log(f"Interval: {interval} min | notify_only_improvement={notify_only_improvement}")
 
     browser = await uc.start(
         browser_executable_path=chrome,
@@ -1211,84 +1414,68 @@ async def run() -> None:
         no_sandbox=True,
     )
     _log("Chrome launched")
+
+    best_date_ever: Optional[datetime] = None
+    cycle = 0
+
     try:
         _log(f"Navigating to {BASE_URL} ...")
         tab = await browser.get(BASE_URL)
         await asyncio.sleep(2.0)
         await _log_page_state(tab, "initial load")
 
-        # ── Phase 1: clear Cloudflare gating ──────────────────────────────────
-        _log("--- Phase 1: Cloudflare guard ---")
-        await cf_guard(tab)
+        # ── Phase 1 & 2: Cloudflare + login ──────────────────────────────────
+        _log("--- Phase 1+2: Cloudflare guard + login ---")
+        await _login_flow(tab)
 
-        # ── Phase 2: login ────────────────────────────────────────────────────
-        _log("--- Phase 2: Login ---")
-        await wait_for_login_page(tab)
-        await perform_login(tab)
-        await answer_security_questions(tab)
-        await asyncio.sleep(2.0)
-        await cf_guard(tab)
+        # ── Monitoring loop ───────────────────────────────────────────────────
+        while True:
+            cycle += 1
+            _log(f"=== Scan cycle {cycle} ===")
 
-        # ── Phase 3: reschedule page ──────────────────────────────────────────
-        _log("--- Phase 3: Navigate to Reschedule ---")
-        await goto_reschedule(tab)
-        await asyncio.sleep(2.0)
+            try:
+                best, report, booking_note = await _scan_cycle(tab, cycle)
 
-        # ── Phase 4: find the OFC/consulate dropdown ──────────────────────────
-        _log("--- Phase 4: Find post dropdown ---")
-        dropdown_sel = await find_dropdown_selector(tab)
-        if not dropdown_sel:
-            await _log_page_state(tab, "no dropdown found")
-            raise RuntimeError(
-                "OFC/consulate dropdown not found on the reschedule page. "
-                "The page layout may have changed."
-            )
+                # Decide whether to send Telegram notification.
+                if best and best.earliest:
+                    dt = _parse_date(best.earliest)
+                    should_notify = (
+                        not notify_only_improvement
+                        or best_date_ever is None
+                        or (dt is not None and dt < best_date_ever)
+                    )
+                    if should_notify:
+                        telegram_text = report + (f"\n\n{booking_note}" if booking_note else "")
+                        send_telegram(telegram_text)
+                        if dt is not None and (best_date_ever is None or dt < best_date_ever):
+                            _log(f"New best date: {best.earliest} @ {best.post}")
+                            best_date_ever = dt
+                    else:
+                        _log(
+                            f"Best date unchanged ({best.earliest}) — "
+                            "skipping Telegram notification"
+                        )
+                else:
+                    if not notify_only_improvement:
+                        send_telegram(report)
 
-        options = await get_all_options(tab, dropdown_sel)
-        if not options:
-            raise RuntimeError("Dropdown found but it contains no options.")
+            except Exception as exc:
+                _log(f"Cycle {cycle} error: {exc}")
+                import traceback; traceback.print_exc()
 
-        _log(
-            f"found {len(options)} posts in dropdown: "
-            f"{[lbl for _, lbl in options]}"
-        )
+            _log(f"Cycle {cycle} done. Next scan in {interval} min ...")
+            await asyncio.sleep(interval * 60)
 
-        # Apply USVISA_POSTS filter if configured
-        configured = env("USVISA_POSTS")
-        if configured:
-            want = {p.strip().lower() for p in configured.split(",") if p.strip()}
-            filtered = [
-                (v, lbl) for v, lbl in options
-                if lbl.lower() in want or v.lower() in want
-            ]
-            if filtered:
-                options = filtered
-                _log(f"USVISA_POSTS filter applied: {[lbl for _, lbl in options]}")
-            else:
-                _log("USVISA_POSTS filter matched nothing — scanning all posts")
+            # Re-navigate to home for the next cycle.
+            _log("Returning to home page ...")
+            await tab.get(BASE_URL)
+            await asyncio.sleep(2.0)
+            await cf_guard(tab)
 
-        # ── Phase 5: scan every post ──────────────────────────────────────────
-        _log(f"--- Phase 5: Scan {len(options)} post(s) ---")
-        results: List[SlotResult] = []
-        for i, (value, label) in enumerate(options, 1):
-            _log(f"post {i}/{len(options)}: {label!r}")
-            results.append(await scan_post(tab, dropdown_sel, value, label))
-
-        # ── Phase 6: report & notify ──────────────────────────────────────────
-        _log("--- Phase 6: Build report ---")
-        report, best = build_report(results)
-        booking_note = await try_auto_book(tab, best)
-
-        plain = re.sub(r"<[^>]+>", "", report)
-        print("\n" + "=" * 60)
-        print(plain)
-        if booking_note:
-            print(booking_note)
-        print("=" * 60 + "\n")
-
-        telegram_text = report + (f"\n\n{booking_note}" if booking_note else "")
-        send_telegram(telegram_text)
-        _log("=== Done ===")
+            # Re-login if session expired.
+            if not await _is_logged_in(tab):
+                _log("Session expired — re-logging in ...")
+                await _login_flow(tab)
 
     finally:
         _log("closing browser")

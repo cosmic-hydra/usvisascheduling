@@ -2,6 +2,7 @@
 .env
 *.env
 .env.*
+!.env.example
 
 # Chrome profile data
 /tmp/usvisa_profile/
