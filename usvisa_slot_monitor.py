@@ -881,6 +881,7 @@ async def run() -> None:
         browser_executable_path=_find_chrome(),
         headless=False,
         user_data_dir=_get_profile_dir(),
+        no_sandbox=True,
     )
     try:
         tab = await browser.get(BASE_URL)
