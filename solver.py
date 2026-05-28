@@ -203,6 +203,29 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
+        print("Usage: python solver.py <sitekey> <siteurl> [timeout]")
+        sys.exit(1)
+
+    _sitekey = sys.argv[1]
+    _siteurl = sys.argv[2]
+    _timeout = int(sys.argv[3]) if len(sys.argv) > 3 else 45
+
+    _xvfb = _start_xvfb_if_needed()
+    try:
+        _token = solve(_sitekey, _siteurl, _timeout)
+        print(_token)
+    except (TimeoutError, FileNotFoundError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if _xvfb:
+            _xvfb.terminate()
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 3:
         print("Usage: python solver.py <sitekey> <siteurl>")
         sys.exit(1)
 

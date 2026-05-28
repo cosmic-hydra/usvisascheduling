@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>⚡ EzSolver</h1>
+<h1>USVISASCHEDULING.COM bot</h1>
 
 <p><strong>Fast, cross-platform Cloudflare Turnstile solver powered by a real browser.</strong><br/>
 No paid APIs. No third-party services. Just Python and Chrome.</p>
@@ -224,13 +224,56 @@ MAX_WORKERS=8 PORT=9000 python service.py
 
 ---
 
+## US Visa Slot Monitor
+
+`usvisa_slot_monitor.py` logs into [usvisascheduling.com](https://www.usvisascheduling.com/en-US), navigates to the Reschedule Appointment page, scans each configured OFC post for the earliest available slot, and optionally sends a Telegram notification or auto-books the best slot found.
+
+```bash
+pip install playwright
+playwright install chromium
+
+# required
+export USVISA_USERNAME="your@email.com"
+export USVISA_PASSWORD="yourpassword"
+export USVISA_Q1="answer1"
+export USVISA_Q2="answer2"
+export USVISA_Q3="answer3"
+
+python usvisa_slot_monitor.py
+```
+
+**Environment variables:**
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `USVISA_USERNAME` | yes | — | Login email |
+| `USVISA_PASSWORD` | yes | — | Login password |
+| `USVISA_Q1` / `Q2` / `Q3` | yes | — | Security question answers |
+| `USVISA_POSTS` | no | `chennai,delhi,bangalore,mumbai,hyderabad,kolkata` | Comma-separated OFC posts to check |
+| `TELEGRAM_BOT_TOKEN` | no | — | Telegram bot token for notifications |
+| `TELEGRAM_CHAT_ID` | no | — | Telegram chat ID for notifications |
+| `AUTO_BOOK` | no | `false` | Set to `true` to auto-book the earliest slot |
+| `RESCHEDULE_LINK_TEXT` | no | `Reschedule Appointment` | Link text to click to reach the reschedule page |
+| `LOGIN_EMAIL_SELECTOR` | no | `input[type='email']` | Override CSS selector for email field |
+| `LOGIN_PASSWORD_SELECTOR` | no | `input[type='password']` | Override CSS selector for password field |
+| `LOGIN_SUBMIT_SELECTOR` | no | `button[type='submit']` | Override CSS selector for login button |
+| `SECURITY_ANSWER_INPUTS_SELECTOR` | no | `input[type='text']` | Override selector for security answer inputs |
+| `POST_DROPDOWN_SELECTOR` | no | auto | Override selector for the OFC post dropdown |
+| `EARLIEST_DATE_SELECTOR` | no | auto | Override selector for the earliest date element |
+| `BOOK_DATE_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — date picker selector |
+| `BOOK_TIME_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — time picker selector |
+| `BOOK_SUBMIT_SELECTOR` | no | — | Required for `AUTO_BOOK=true` — submit button selector |
+
+---
+
 ## Project structure
 
 ```
 EzSolver/
-├── solver.py      # Core solver — browser automation logic
-├── service.py     # HTTP API wrapper around the solver
-└── clientsend.py  # CLI client + importable helper for service.py
+├── solver.py                # Core solver — browser automation logic
+├── service.py               # HTTP API wrapper around the solver
+├── clientsend.py            # CLI client + importable helper for service.py
+└── usvisa_slot_monitor.py   # US visa appointment slot monitor (Playwright)
 ```
 
 ---

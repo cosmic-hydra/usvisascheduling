@@ -1,0 +1,18 @@
+# Credentials — never commit these
+.env
+*.env
+.env.*
+
+# Chrome profile data
+/tmp/usvisa_profile/
+ts_profile/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
