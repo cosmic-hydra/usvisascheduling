@@ -284,6 +284,94 @@ async def handle_waiting_room(tab) -> None:
     )
 
 
+# ─── Cloudflare: rate-limit handling ─────────────────────────────────────────
+
+async def _is_rate_limited(tab) -> bool:
+    """Return True when Cloudflare is rate-limiting (HTTP 429 / CF error 1015)."""
+    text = await _page_text(tab)
+    title = (await _page_title(tab)).lower()
+    return any(phrase in text for phrase in [
+        "too many requests",
+        "rate limit",
+        "error 429",
+        "error 1015",
+        "you have been temporarily blocked",
+        "access denied",
+    ]) or "429" in title or "1015" in title
+
+
+async def _handle_rate_limit(tab) -> None:
+    """
+    Exponential back-off when Cloudflare is rate-limiting.
+    Waits 30 → 60 → 120 → 240 → 300 s between retries.
+    """
+    for attempt in range(5):
+        backoff = min(300, 30 * (2 ** attempt)) + random.uniform(0, 20)
+        _log(f"Rate limited — backing off {backoff:.0f}s (attempt {attempt + 1}/5)")
+        await asyncio.sleep(backoff)
+        try:
+            await tab.get(BASE_URL)
+            await asyncio.sleep(3.0)
+        except Exception:
+            pass
+        if not await _is_rate_limited(tab):
+            _log("Rate limit lifted — resuming")
+            return
+    _log("WARNING: still rate-limited after 5 attempts — continuing anyway")
+
+
+# ─── Cloudflare: AI challenge classifier ─────────────────────────────────────
+
+async def _ai_classify_cf(tab) -> dict:
+    """
+    Ask Claude to read the current page and identify what Cloudflare protection
+    is active, returning the best action to take.
+
+    Returns a dict with keys ``type`` and ``action``.  Falls back to
+    ``{"type": "unknown", "action": "proceed"}`` on any error or when the
+    API key is absent.
+
+    Challenge types : none | turnstile | js_check | waiting_room | rate_limit | block
+    Actions         : proceed | click_checkbox | wait_js | wait_queue | backoff | abort
+    """
+    default: dict = {"type": "unknown", "action": "proceed"}
+    if not _HAS_ANTHROPIC:
+        return default
+    api_key = env("ANTHROPIC_API_KEY")
+    if not api_key:
+        return default
+
+    try:
+        url   = await _page_url(tab)
+        title = await _page_title(tab)
+        body  = (await _page_text(tab))[:1500]
+
+        client = _anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=128,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Analyse this browser page for Cloudflare protection. "
+                    "Reply ONLY with a compact JSON object.\n\n"
+                    f"URL: {url}\nTitle: {title}\nBody snippet: {body}\n\n"
+                    "Challenge types: none, turnstile, js_check, waiting_room, "
+                    "rate_limit, block\n"
+                    "Actions: proceed, click_checkbox, wait_js, wait_queue, "
+                    "backoff, abort\n\n"
+                    'Reply format: {"type":"...","action":"..."}'
+                ),
+            }],
+        )
+        result = json.loads(msg.content[0].text.strip())
+        _log(f"AI CF analysis: {result}")
+        return result
+    except Exception as exc:
+        _log(f"AI CF classify error ({exc}) — using default")
+        return default
+
+
 # ─── Cloudflare: Turnstile ────────────────────────────────────────────────────
 
 async def _cf_iframe_rect(tab) -> Optional[dict]:
@@ -415,22 +503,83 @@ async def _security_checkbox_point(tab) -> tuple:
     return (280.0, 380.0)
 
 
+async def _bezier_mouse_move(tab, tx: float, ty: float, steps: int = 20) -> None:
+    """
+    Move the mouse to (tx, ty) along a cubic Bezier curve.
+    Reads the last tracked position from window._mouseX/Y so consecutive calls
+    form a continuous natural path.
+    """
+    try:
+        pos_raw = await tab.evaluate(
+            "JSON.stringify({x: window._mouseX || window.innerWidth/2,"
+            "                y: window._mouseY || window.innerHeight/2})"
+        )
+        p = json.loads(pos_raw) if pos_raw and pos_raw != "null" else {}
+        sx, sy = float(p.get("x", 640)), float(p.get("y", 450))
+    except Exception:
+        sx, sy = 640.0, 450.0
+
+    dx, dy = tx - sx, ty - sy
+    # Perpendicular offset creates a gentle arc instead of a straight line.
+    perp_x = -dy * random.uniform(0.08, 0.22)
+    perp_y =  dx * random.uniform(0.08, 0.22)
+
+    cx1 = sx + dx * 0.30 + perp_x + random.uniform(-12, 12)
+    cy1 = sy + dy * 0.30 + perp_y + random.uniform(-12, 12)
+    cx2 = sx + dx * 0.70 + perp_x + random.uniform(-12, 12)
+    cy2 = sy + dy * 0.70 + perp_y + random.uniform(-12, 12)
+
+    for i in range(steps + 1):
+        t = i / steps
+        mt = 1 - t
+        x = mt**3 * sx + 3*mt**2*t * cx1 + 3*mt*t**2 * cx2 + t**3 * tx
+        y = mt**3 * sy + 3*mt**2*t * cy1 + 3*mt*t**2 * cy2 + t**3 * ty
+        await tab.mouse_move(x, y)
+        # Ease-in/out: faster in the middle, slower near endpoints.
+        speed = max(0.3, 1.0 - abs(2 * t - 1) * 0.6)
+        await asyncio.sleep(random.uniform(0.008, 0.022) / speed)
+
+    try:
+        await tab.evaluate(f"window._mouseX={tx}; window._mouseY={ty};")
+    except Exception:
+        pass
+
+
 async def _simulate_human_behavior(tab) -> None:
-    """Move the mouse and scroll a little so Cloudflare fingerprinting sees a human."""
+    """
+    Simulate human browsing with Bezier mouse paths, natural scrolling, and
+    micro-pauses so Cloudflare fingerprinting classifies the session as human.
+    """
     try:
         w = int(await tab.evaluate("window.innerWidth || 1280") or 1280)
         h = int(await tab.evaluate("window.innerHeight || 900") or 900)
-        mx = random.randint(int(w * 0.2), int(w * 0.8))
-        my = random.randint(int(h * 0.2), int(h * 0.5))
-        await tab.mouse_move(mx, my)
-        await asyncio.sleep(random.uniform(0.3, 0.7))
-        await tab.evaluate(f"window.scrollBy(0, {random.randint(30, 100)})")
-        await asyncio.sleep(random.uniform(0.3, 0.6))
-        await tab.mouse_move(
-            mx + random.randint(-60, 60),
-            my + random.randint(-40, 40),
+
+        # Visit 2–4 random spots with natural curved mouse paths.
+        for _ in range(random.randint(2, 4)):
+            tx = random.randint(int(w * 0.12), int(w * 0.88))
+            ty = random.randint(int(h * 0.12), int(h * 0.65))
+            await _bezier_mouse_move(tab, tx, ty)
+            await asyncio.sleep(random.uniform(0.18, 0.65))
+
+        # Scroll down naturally, then partially back up.
+        down = random.randint(55, 160)
+        await tab.evaluate(
+            f"window.scrollBy({{top: {down}, left: 0, behavior: 'smooth'}})"
         )
-        await asyncio.sleep(random.uniform(0.2, 0.4))
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        up = random.randint(10, 40)
+        await tab.evaluate(
+            f"window.scrollBy({{top: -{up}, left: 0, behavior: 'smooth'}})"
+        )
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        # Final resting position near the centre.
+        await _bezier_mouse_move(
+            tab,
+            random.randint(int(w * 0.3), int(w * 0.7)),
+            random.randint(int(h * 0.3), int(h * 0.6)),
+        )
+        await asyncio.sleep(random.uniform(0.2, 0.45))
     except Exception:
         pass
 
@@ -495,15 +644,13 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
                 cx = rect["x"] + min(36, max(20, rect["w"] * 0.22)) + random.uniform(-3, 3)
                 cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
                 _log(f"clicking Turnstile checkbox at ({cx:.0f}, {cy:.0f})")
-                await tab.mouse_move(cx - 60, cy - 15)
-                await asyncio.sleep(random.uniform(0.15, 0.25))
-                await tab.mouse_move(cx, cy)
+                # Bezier approach from current position — looks more human.
+                await _bezier_mouse_move(tab, cx, cy)
                 await asyncio.sleep(random.uniform(0.08, 0.15))
                 await tab.mouse_click(cx, cy)
                 last_click = asyncio.get_event_loop().time()
                 clicks += 1
 
-                # Wait briefly for challenge confirmation after each click.
                 confirm_deadline = asyncio.get_event_loop().time() + 12
                 while asyncio.get_event_loop().time() < confirm_deadline:
                     if await is_confirmed():
@@ -511,14 +658,12 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
                         return
                     await asyncio.sleep(0.4)
             else:
-                # Last-resort click for opaque challenge layouts where iframe rect cannot be read.
+                # Last-resort click for opaque challenge layouts.
                 px, py = await _security_checkbox_point(tab)
                 cx = px + random.uniform(-2, 2)
                 cy = py + random.uniform(-2, 2)
                 _log(f"iframe rect unavailable — fallback click at ({cx:.0f}, {cy:.0f})")
-                await tab.mouse_move(cx - 40, cy - 10)
-                await asyncio.sleep(random.uniform(0.12, 0.2))
-                await tab.mouse_move(cx, cy)
+                await _bezier_mouse_move(tab, cx, cy)
                 await asyncio.sleep(random.uniform(0.06, 0.12))
                 await tab.mouse_click(cx, cy)
                 last_click = asyncio.get_event_loop().time()
@@ -530,6 +675,37 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
                         _log("Turnstile confirmed after click")
                         return
                     await asyncio.sleep(0.4)
+
+            # After 2 failed clicks, try a keyboard fallback (Tab → Space).
+            if clicks >= 2 and not await is_confirmed():
+                _log("trying keyboard fallback (Tab + Space) for Turnstile ...")
+                try:
+                    await tab.evaluate("""
+                        (() => {
+                            // Focus the CF iframe if we can
+                            for (const f of document.querySelectorAll('iframe')) {
+                                const src = (f.src || '').toLowerCase();
+                                if (src.includes('challenges.cloudflare.com')
+                                        || src.includes('turnstile')) {
+                                    f.focus();
+                                    break;
+                                }
+                            }
+                            const tabDown  = new KeyboardEvent('keydown', {key:'Tab',  code:'Tab',  bubbles:true});
+                            const tabUp    = new KeyboardEvent('keyup',   {key:'Tab',  code:'Tab',  bubbles:true});
+                            const spaceDown= new KeyboardEvent('keydown', {key:' ',    code:'Space',bubbles:true});
+                            const spaceUp  = new KeyboardEvent('keyup',   {key:' ',    code:'Space',bubbles:true});
+                            document.dispatchEvent(tabDown);
+                            document.dispatchEvent(tabUp);
+                            setTimeout(() => {
+                                document.dispatchEvent(spaceDown);
+                                document.dispatchEvent(spaceUp);
+                            }, 300);
+                        })()
+                    """)
+                    await asyncio.sleep(2.0)
+                except Exception as kb_exc:
+                    _log(f"keyboard fallback error: {kb_exc}")
 
         await asyncio.sleep(0.5)
 
@@ -583,30 +759,53 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     """
     Wait until all Cloudflare challenges clear.
 
-    Handles three kinds:
-    1. Cloudflare Waiting Room  — periodic polling
-    2. JS Challenge ("Just a moment...")  — Chrome passes this automatically; we wait
-    3. Turnstile checkbox widget  — we click it
-    """
-    await handle_waiting_room(tab)
+    Handles:
+    1. Rate limiting (HTTP 429 / CF error 1015) — exponential back-off
+    2. Cloudflare Waiting Room — periodic polling
+    3. JS Challenge ("Just a moment") — Chrome resolves automatically; we wait
+    4. Turnstile checkbox — human-like Bezier click
+    5. Outright block — raises RuntimeError
 
-    # Simulate human browsing before any click attempt so Cloudflare fingerprinting
-    # sees natural mouse + scroll behaviour first.
+    When ANTHROPIC_API_KEY is set an AI classifier runs first to choose
+    the best strategy for whatever challenge variant is shown.
+    """
+    # ── Step 0: rate-limit check (fast, no API needed) ───────────────────────
+    if await _is_rate_limited(tab):
+        await _handle_rate_limit(tab)
+
+    # ── Step 1: AI-assisted classification ───────────────────────────────────
+    cf_info = await _ai_classify_cf(tab)
+    action = cf_info.get("action", "proceed")
+
+    if action == "abort":
+        raise RuntimeError(
+            f"Cloudflare outright blocked the request "
+            f"(AI type={cf_info.get('type')}). "
+            "Try again later or change your IP."
+        )
+    if action == "backoff":
+        _log(f"AI recommends back-off (type={cf_info.get('type')}) — running rate-limit handler")
+        await _handle_rate_limit(tab)
+    elif action == "wait_queue":
+        await handle_waiting_room(tab)
+    else:
+        await handle_waiting_room(tab)
+
+    # ── Step 2: human behaviour simulation ───────────────────────────────────
     await _simulate_human_behavior(tab)
 
-    # The managed/malicious-check variant can show only the checkbox iframe.
-    # Delay first click to mimic a real user reading the page (default raised to 8 s).
+    # ── Step 3: Turnstile click with pre-delay ────────────────────────────────
     click_delay = float(env("CF_CLICK_DELAY_SECONDS", "8"))
     last_solve_attempt = 0.0
 
     if await _is_security_verification_page(tab) and await _has_turnstile_iframe(tab):
-        _log(f"security verification page detected — waiting {click_delay:.0f}s before checkbox click")
+        _log(f"security verification page — waiting {click_delay:.0f}s before checkbox click")
         await asyncio.sleep(click_delay)
 
     await solve_turnstile(tab)
     last_solve_attempt = asyncio.get_event_loop().time()
 
-    # If already past any challenge, return immediately
+    # ── Step 4: poll until cleared ────────────────────────────────────────────
     if not await _is_cf_challenge(tab):
         _log("No CF challenge detected — proceeding")
         return
@@ -615,9 +814,13 @@ async def cf_guard(tab, timeout: int = 90) -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     poll = 0
     while asyncio.get_event_loop().time() < deadline:
-        # Avoid repeatedly re-solving every poll; retry only on cooldown.
+        # Re-check rate limit mid-wait.
+        if await _is_rate_limited(tab):
+            await _handle_rate_limit(tab)
+
         now = asyncio.get_event_loop().time()
         if await _has_turnstile_iframe(tab) and (now - last_solve_attempt >= 20):
+            await _simulate_human_behavior(tab)
             await solve_turnstile(tab)
             last_solve_attempt = asyncio.get_event_loop().time()
 
@@ -632,7 +835,8 @@ async def cf_guard(tab, timeout: int = 90) -> None:
             await _log_page_state(tab, f"cf_guard poll {poll}")
         else:
             title = await _page_title(tab)
-            _log(f"still on CF challenge (title: '{title}', elapsed: {int(asyncio.get_event_loop().time()-(deadline-timeout))}s)")
+            elapsed = int(asyncio.get_event_loop().time() - (deadline - timeout))
+            _log(f"still on CF challenge (title: '{title}', elapsed: {elapsed}s)")
 
         await asyncio.sleep(2.0)
 
