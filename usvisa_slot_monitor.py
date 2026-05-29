@@ -128,9 +128,9 @@ def _find_chrome() -> str:
 
     # Termux (Android) — Chromium installed via `pkg install chromium`
     if _is_termux():
-        termux_prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+        prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
         for name in ("chromium", "chromium-browser", "google-chrome"):
-            p = os.path.join(termux_prefix, "bin", name)
+            p = os.path.join(prefix, "bin", name)
             if os.path.isfile(p):
                 return p
 
@@ -151,9 +151,10 @@ def _find_chrome() -> str:
         if os.path.isfile(p):
             return p
     raise FileNotFoundError(
-        "Chrome not found. "
-        "On Termux run: pkg install chromium\n"
-        "Or set CHROME_PATH in your .env file."
+        "Chrome not found.\n"
+        "  Termux  : pkg install chromium\n"
+        "  Linux   : sudo apt install chromium-browser\n"
+        "  Override: set CHROME_PATH in .env"
     )
 
 
@@ -161,7 +162,6 @@ def _get_profile_dir() -> str:
     if os.environ.get("TS_PROFILE_DIR"):
         return os.environ["TS_PROFILE_DIR"]
     if _is_termux():
-        # Use a directory inside Termux home so it persists between runs.
         home = os.environ.get("HOME", "/data/data/com.termux/files/home")
         return os.path.join(home, ".usvisa_profile")
     if platform.system() == "Windows":
@@ -171,24 +171,87 @@ def _get_profile_dir() -> str:
     return os.path.join(base, "usvisa_profile")
 
 
-def _start_xvfb() -> Optional[subprocess.Popen]:
-    """
-    On headless Linux servers start Xvfb.  Skipped on Windows and on
-    Android/Termux (the Android compositor is already available).
-    """
+def _get_chrome_flags() -> List[str]:
+    """Return platform-appropriate extra Chrome flags."""
+    flags: List[str] = ["--no-sandbox", "--disable-dev-shm-usage"]
     if _is_termux():
-        return None  # Android provides its own display
-    if platform.system() != "Linux" or os.environ.get("DISPLAY"):
+        flags += [
+            "--disable-gpu",
+            "--window-size=1280,900",
+            "--disable-features=VizDisplayCompositor",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+        ]
+    return flags
+
+
+def _setup_display() -> Optional[subprocess.Popen]:
+    """
+    Ensure a display is available for Chrome:
+      • Termux — try Termux:X11 first, then VNC
+      • Headless Linux — start Xvfb
+      • Windows / already-set DISPLAY — nothing needed
+    """
+    if os.environ.get("DISPLAY"):
         return None
-    proc = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1280x1024x24"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    os.environ["DISPLAY"] = ":99"
-    time.sleep(0.5)
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] started Xvfb on :99")
-    return proc
+
+    if _is_termux():
+        # Try Termux:X11 (install: pkg install x11-repo && pkg install termux-x11-nightly)
+        try:
+            proc = subprocess.Popen(
+                ["termux-x11", ":0", "-xstartup", ""],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.environ["DISPLAY"] = ":0"
+            time.sleep(2)
+            _log("Termux:X11 started on :0")
+            return proc
+        except FileNotFoundError:
+            pass
+
+        # Fallback: Xvfb if available on Termux
+        try:
+            proc = subprocess.Popen(
+                ["Xvfb", ":1", "-screen", "0", "1280x900x24"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.environ["DISPLAY"] = ":1"
+            time.sleep(1)
+            _log("Xvfb started on :1 (Termux fallback)")
+            return proc
+        except FileNotFoundError:
+            _log(
+                "WARNING: No display server found on Termux.\n"
+                "  Install Termux:X11:\n"
+                "    pkg install x11-repo\n"
+                "    pkg install termux-x11-nightly\n"
+                "  Then open the Termux:X11 companion app before running."
+            )
+            return None
+
+    if platform.system() != "Linux":
+        return None
+
+    try:
+        proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x1024x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(0.5)
+        _log("Xvfb started on :99")
+        return proc
+    except FileNotFoundError:
+        _log("Xvfb not found — install with: sudo apt install xvfb")
+        return None
+
+
+# Keep the old name as an alias so __main__ block still works.
+_start_xvfb = _setup_display
 
 
 # ─── IP rotation ─────────────────────────────────────────────────────────────
@@ -408,6 +471,78 @@ async def _log_page_state(tab, label: str = "") -> None:
     _log(f"{prefix} URL   : {url}")
     _log(f"{prefix} Title : {title}")
     _log(f"{prefix} Body  : {snippet}")
+
+
+async def _apply_stealth(tab) -> None:
+    """
+    Patch the page JS environment to hide browser-automation signals that
+    Cloudflare's fingerprinting checks look for.
+    Called once after each navigation to a new page.
+    """
+    try:
+        await tab.evaluate("""
+            (() => {
+                // 1. Remove the navigator.webdriver flag
+                try {
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                } catch(e) {}
+
+                // 2. Add a realistic window.chrome object (headless Chrome lacks it)
+                if (!window.chrome) {
+                    window.chrome = {
+                        app: {isInstalled: false},
+                        runtime: {
+                            onMessage: {addListener: () => {}},
+                            connect: () => ({onMessage: {addListener: () => {}},
+                                             onDisconnect: {addListener: () => {}},
+                                             postMessage: () => {}})
+                        }
+                    };
+                }
+
+                // 3. Fix navigator.permissions.query (headless throws on 'notifications')
+                if (navigator.permissions && navigator.permissions.query) {
+                    const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+                    navigator.permissions.query = (p) =>
+                        p.name === 'notifications'
+                            ? Promise.resolve({state: Notification.permission})
+                            : _origQuery(p);
+                }
+
+                // 4. Realistic plugin list (headless has 0 plugins)
+                if (navigator.plugins.length === 0) {
+                    try {
+                        Object.defineProperty(navigator, 'plugins', {
+                            get: () => {
+                                const arr = [
+                                    {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
+                                    {name:'Chrome PDF Viewer',  filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                                    {name:'Native Client',      filename:'internal-nacl-plugin'},
+                                ];
+                                arr.length = arr.length;  // make it look like a PluginArray
+                                return arr;
+                            }
+                        });
+                    } catch(e) {}
+                }
+
+                // 5. Consistent language list
+                try {
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                } catch(e) {}
+
+                // 6. Hide headless from User-Agent string
+                try {
+                    Object.defineProperty(navigator, 'userAgent', {
+                        get: () => navigator.userAgent.replace('HeadlessChrome', 'Chrome')
+                    });
+                } catch(e) {}
+            })()
+        """)
+    except Exception as exc:
+        _log(f"stealth patch error (non-fatal): {exc}")
 
 
 # ─── Cloudflare: Waiting Room ─────────────────────────────────────────────────
@@ -881,6 +1016,25 @@ async def solve_turnstile(tab, timeout: int = 60) -> None:
         # Click the checkbox (retry up to 4 times, every 10 s)
         now = asyncio.get_event_loop().time()
         if clicks == 0 or (now - last_click > 10 and clicks < 4):
+            # Scroll the Turnstile iframe into the viewport before reading its rect.
+            await tab.evaluate("""
+                (() => {
+                    for (const f of document.querySelectorAll('iframe')) {
+                        const s = (f.src||'').toLowerCase();
+                        if (s.includes('challenges.cloudflare.com')
+                                || s.includes('turnstile')
+                                || s.includes('/cdn-cgi/challenge')) {
+                            f.scrollIntoView({block:'center', behavior:'smooth'});
+                            return;
+                        }
+                    }
+                    // Fallback: scroll any visible iframe into view
+                    const iframes = document.querySelectorAll('iframe');
+                    if (iframes.length) iframes[0].scrollIntoView({block:'center'});
+                })()
+            """)
+            await asyncio.sleep(0.8)
+
             rect = await _cf_iframe_rect(tab)
             if rect:
                 # Cloudflare checkbox sits on the left side of the challenge iframe.
@@ -1998,20 +2152,30 @@ async def try_auto_book(tab, best: Optional[SlotResult]) -> str:
 # ─── main flow ────────────────────────────────────────────────────────────────
 
 async def _login_flow(tab) -> None:
-    """Run through CF guard → login → security questions in sequence."""
+    """Run through stealth patch → CF guard → login → security questions."""
+    await _apply_stealth(tab)
     await cf_guard(tab)
     await wait_for_login_page(tab)
     await perform_login(tab)
     await answer_security_questions(tab)
     await asyncio.sleep(2.0)
+    await _apply_stealth(tab)
     await cf_guard(tab)
 
 
-async def _scan_cycle(tab, cycle: int):
+async def _scan_cycle(
+    tab,
+    cycle: int,
+    current_booked_dt: Optional[datetime] = None,
+):
     """
-    One full scan: reschedule page → ALL posts → find global earliest → auto-book.
+    One full scan: reschedule page → ALL posts → find global earliest.
+    Books the slot only when it is strictly earlier than current_booked_dt
+    (or current_booked_dt is None, meaning nothing is booked yet).
 
-    Returns (best: SlotResult | None, report: str, booking_note: str).
+    Returns (best, report, booking_note, new_booked_dt).
+    new_booked_dt is the datetime of the newly booked slot, or None if
+    nothing was booked this cycle.
     """
     _log(f"--- Cycle {cycle}: navigate to reschedule ---")
     await goto_reschedule(tab)
@@ -2021,9 +2185,7 @@ async def _scan_cycle(tab, cycle: int):
     dropdown_sel = await find_dropdown_selector(tab)
     if not dropdown_sel:
         await _log_page_state(tab, "no dropdown found")
-        raise RuntimeError(
-            "OFC/consulate dropdown not found. Page layout may have changed."
-        )
+        raise RuntimeError("OFC/consulate dropdown not found. Page layout may have changed.")
 
     options = await get_all_options(tab, dropdown_sel)
     if not options:
@@ -2034,10 +2196,7 @@ async def _scan_cycle(tab, cycle: int):
     configured = env("USVISA_POSTS")
     if configured:
         want = {p.strip().lower() for p in configured.split(",") if p.strip()}
-        filtered = [
-            (v, lbl) for v, lbl in options
-            if lbl.lower() in want or v.lower() in want
-        ]
+        filtered = [(v, lbl) for v, lbl in options if lbl.lower() in want or v.lower() in want]
         if filtered:
             options = filtered
             _log(f"USVISA_POSTS filter: {[lbl for _, lbl in options]}")
@@ -2046,7 +2205,7 @@ async def _scan_cycle(tab, cycle: int):
 
     _log(f"--- Cycle {cycle}: scan {len(options)} post(s) ---")
     results: List[SlotResult] = []
-    post_map: dict = {}  # label → (value, label)
+    post_map: dict = {}
     for i, (value, label) in enumerate(options, 1):
         _log(f"post {i}/{len(options)}: {label!r}")
         r = await scan_post(tab, dropdown_sel, value, label)
@@ -2056,70 +2215,92 @@ async def _scan_cycle(tab, cycle: int):
     report, best = build_report(results)
 
     plain = re.sub(r"<[^>]+>", "", report)
+    cur_str = current_booked_dt.strftime("%Y-%m-%d") if current_booked_dt else "none"
     print("\n" + "=" * 60)
     print(plain)
+    print(f"Current booking : {cur_str}")
     print("=" * 60 + "\n")
 
-    # ── Auto-book the globally earliest slot ─────────────────────────────────
+    # ── Decide whether to book ────────────────────────────────────────────────
     booking_note = ""
-    if best and best.earliest:
-        post_value, post_label_full = post_map.get(best.post, (None, best.post))
-        if post_value:
-            _log(f"Auto-booking globally earliest slot: {best.earliest} @ {best.post}")
-            try:
-                booked = await book_appointment(
-                    tab, dropdown_sel, post_value, best.post, best.earliest
-                )
-                booking_note = (
-                    f"BOOKED: {best.post} on {best.earliest}"
-                    if booked
-                    else f"BOOKING FAILED: {best.post} on {best.earliest}"
-                )
-                # Notify via Telegram immediately after booking attempt.
-                tg = report + f"\n\n<b>{booking_note}</b>"
-                send_telegram(tg)
-            except Exception as exc:
-                booking_note = f"BOOKING ERROR: {exc}"
-                _log(f"Booking exception: {exc}")
-        else:
-            booking_note = "Could not find post value for booking"
+    new_booked_dt: Optional[datetime] = None
 
-    return best, report, booking_note
+    if best and best.earliest:
+        new_dt = _parse_date(best.earliest)
+        is_improvement = new_dt is not None and (
+            current_booked_dt is None or new_dt < current_booked_dt
+        )
+
+        if is_improvement:
+            post_value, _ = post_map.get(best.post, (None, best.post))
+            if post_value:
+                _log(f"Improvement found: {best.earliest} @ {best.post} "
+                     f"(was: {cur_str}) — booking ...")
+                try:
+                    booked = await book_appointment(
+                        tab, dropdown_sel, post_value, best.post, best.earliest
+                    )
+                    if booked:
+                        new_booked_dt = new_dt
+                        booking_note = f"BOOKED: {best.post} on {best.earliest}"
+                    else:
+                        booking_note = f"BOOKING FAILED: {best.post} on {best.earliest}"
+                    send_telegram(report + f"\n\n<b>{booking_note}</b>")
+                except Exception as exc:
+                    booking_note = f"BOOKING ERROR: {exc}"
+                    _log(f"Booking exception: {exc}")
+            else:
+                booking_note = "Could not resolve post value — skipping booking"
+        else:
+            booking_note = (
+                f"No improvement over current booking ({cur_str}) — "
+                f"best found: {best.earliest}"
+            )
+            _log(booking_note)
+
+    return best, report, booking_note, new_booked_dt
 
 
 async def run() -> None:
     global _ip_rotator
 
-    chrome  = _find_chrome()
-    profile = _get_profile_dir()
+    chrome   = _find_chrome()
+    profile  = _get_profile_dir()
     interval = int(env("MONITOR_INTERVAL_MINUTES", "15"))
-    notify_only_improvement = env("NOTIFY_ONLY_ON_IMPROVEMENT", "true").lower() != "false"
+
+    # Parse optional target date — bot stops once it books on or before this date.
+    target_dt: Optional[datetime] = None
+    target_str = env("TARGET_DATE")
+    if target_str:
+        target_dt = _parse_date(target_str)
+        if not target_dt:
+            _log(f"WARNING: could not parse TARGET_DATE={target_str!r} — ignoring")
 
     # Initialise IP rotator.
     _ip_rotator = IPRotator()
     _ip_rotator.start()
-    extra_args = _ip_rotator.get_browser_args()
+    extra_flags = _get_chrome_flags() + _ip_rotator.get_browser_args()
 
     _log("=== US Visa Slot Monitor starting ===")
-    _log(f"Chrome   : {chrome}")
-    _log(f"Profile  : {profile}")
-    _log(f"Site     : {BASE_URL}")
-    _log(f"Termux   : {_is_termux()}")
-    _log(f"IP rotate: {_ip_rotator.method}")
-    _log(f"Interval : {interval} min | notify_only_improvement={notify_only_improvement}")
-    if extra_args:
-        _log(f"Chrome extra args: {extra_args}")
+    _log(f"Chrome      : {chrome}")
+    _log(f"Profile     : {profile}")
+    _log(f"Site        : {BASE_URL}")
+    _log(f"Termux      : {_is_termux()}")
+    _log(f"IP rotate   : {_ip_rotator.method}")
+    _log(f"Interval    : {interval} min between idle scans")
+    _log(f"Target date : {target_dt.strftime('%Y-%m-%d') if target_dt else 'not set'}")
 
     browser = await uc.start(
         browser_executable_path=chrome,
         headless=False,
         user_data_dir=profile,
         no_sandbox=True,
-        browser_args=extra_args if extra_args else None,
+        browser_args=extra_flags if extra_flags else None,
     )
     _log("Chrome launched")
 
-    best_date_ever: Optional[datetime] = None
+    # Tracks the date of the most recently booked appointment.
+    current_booked_dt: Optional[datetime] = None
     cycle = 0
 
     try:
@@ -2128,53 +2309,63 @@ async def run() -> None:
         await asyncio.sleep(2.0)
         await _log_page_state(tab, "initial load")
 
-        # ── Phase 1 & 2: Cloudflare + login ──────────────────────────────────
-        _log("--- Phase 1+2: Cloudflare guard + login ---")
+        # ── Phase 1 & 2: stealth + Cloudflare + login ────────────────────────
+        _log("--- Phase 1+2: stealth / Cloudflare / login ---")
         await _login_flow(tab)
 
-        # ── Monitoring loop ───────────────────────────────────────────────────
+        # ── Continuous reschedule loop ────────────────────────────────────────
+        # When an improvement is found, re-scan immediately (no delay) to chase
+        # even earlier dates.  Only sleep when no improvement was found.
         while True:
             cycle += 1
+            improved_this_cycle = False
             _log(f"=== Scan cycle {cycle} ===")
 
             try:
-                best, report, booking_note = await _scan_cycle(tab, cycle)
+                best, report, booking_note, new_booked_dt = await _scan_cycle(
+                    tab, cycle, current_booked_dt
+                )
 
-                # Decide whether to send Telegram notification.
-                if best and best.earliest:
-                    dt = _parse_date(best.earliest)
-                    should_notify = (
-                        not notify_only_improvement
-                        or best_date_ever is None
-                        or (dt is not None and dt < best_date_ever)
-                    )
-                    if should_notify:
-                        telegram_text = report + (f"\n\n{booking_note}" if booking_note else "")
-                        send_telegram(telegram_text)
-                        if dt is not None and (best_date_ever is None or dt < best_date_ever):
-                            _log(f"New best date: {best.earliest} @ {best.post}")
-                            best_date_ever = dt
-                    else:
-                        _log(
-                            f"Best date unchanged ({best.earliest}) — "
-                            "skipping Telegram notification"
+                if new_booked_dt is not None:
+                    current_booked_dt = new_booked_dt
+                    improved_this_cycle = True
+                    _log(f"Booked: {new_booked_dt.strftime('%Y-%m-%d')}")
+
+                    # ── Check if we hit the target ────────────────────────────
+                    if target_dt and current_booked_dt <= target_dt:
+                        msg = (
+                            f"TARGET DATE REACHED!\n"
+                            f"Booked: {best.post} on "
+                            f"{current_booked_dt.strftime('%Y-%m-%d')}\n"
+                            f"(target was {target_dt.strftime('%Y-%m-%d')})"
                         )
-                else:
-                    if not notify_only_improvement:
-                        send_telegram(report)
+                        _log(msg)
+                        send_telegram(f"<b>{msg}</b>")
+                        break  # Mission complete — exit the loop.
 
             except Exception as exc:
                 _log(f"Cycle {cycle} error: {exc}")
                 import traceback; traceback.print_exc()
 
-            _log(f"Cycle {cycle} done. Next scan in {interval} min ...")
-            await asyncio.sleep(interval * 60)
+            if improved_this_cycle:
+                # Scan again immediately — don't waste time when a slot was just booked.
+                _log("Improvement booked — re-scanning immediately for an even earlier slot ...")
+                # Short pause to let the site process the booking before we hit it again.
+                await asyncio.sleep(10)
+            else:
+                _log(f"No improvement this cycle. Waiting {interval} min ...")
+                await asyncio.sleep(interval * 60)
 
-            # Re-navigate to home for the next cycle.
+            # Re-navigate to home page and handle any fresh CF challenge.
             _log("Returning to home page ...")
-            await tab.get(BASE_URL)
-            await asyncio.sleep(2.0)
-            await cf_guard(tab)
+            try:
+                await tab.get(BASE_URL)
+                await asyncio.sleep(2.0)
+                await _apply_stealth(tab)
+                await cf_guard(tab)
+            except Exception as exc:
+                _log(f"Navigation error (will retry): {exc}")
+                await asyncio.sleep(15)
 
             # Re-login if session expired.
             if not await _is_logged_in(tab):
